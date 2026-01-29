@@ -1,0 +1,51 @@
+@import "tailwindcss";
+
+@theme {
+  --font-pixel: "DotGothic16", sans-serif;
+  --color-pixel-bg: #f0f0f0;
+  --color-pixel-dark: #202020;
+  --color-pixel-primary: #ffcd38; /* Retro Yellow */
+  --color-pixel-secondary: #ff6b6b; /* Retro Red */
+  --color-pixel-accent: #4ecdc4; /* Retro Teal */
+}
+
+@layer base {
+  body {
+    font-family: var(--font-pixel);
+    background-color: var(--color-pixel-bg);
+    color: var(--color-pixel-dark);
+    image-rendering: pixelated;
+  }
+
+  /* Custom Pixel Scrollbar */
+  ::-webkit-scrollbar {
+    width: 12px;
+    height: 12px;
+  }
+  ::-webkit-scrollbar-track {
+    background: #e0e0e0;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: var(--color-pixel-dark);
+    border: 2px solid #e0e0e0;
+  }
+}
+
+@layer utilities {
+  .pixel-border {
+    box-shadow: 
+      -4px 0 0 0 var(--color-pixel-dark),
+      4px 0 0 0 var(--color-pixel-dark),
+      0 -4px 0 0 var(--color-pixel-dark),
+      0 4px 0 0 var(--color-pixel-dark);
+    margin: 4px;
+  }
+  
+  .pixel-shadow {
+    box-shadow: 6px 6px 0px 0px rgba(0,0,0,0.2);
+  }
+
+  .text-shadow-pixel {
+    text-shadow: 2px 2px 0px rgba(0,0,0,0.3);
+  }
+}
