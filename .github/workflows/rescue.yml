@@ -36,7 +36,7 @@ jobs:
           
           # 自動修正 vite.config.ts (加入 base)
           sed -i "/base:/d" vite.config.ts
-          sed -i "/plugins: \[/i \  base: '/Morimori/'," vite.config.ts
+          sed -i "/plugins: \[/i \  base: '/PixelGym/'," vite.config.ts
           
           # 把修復結果存回 main (存檔備份)
           git add vite.config.ts
