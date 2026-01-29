@@ -1,0 +1,44 @@
+name: Manual Rescue & Force Deploy
+ 
+on:
+  workflow_dispatch: # 提供手動按鈕
+
+permissions:
+  contents: write
+  pages: write      # 部署 Pages 權限
+  id-token: write   # 解決剛才噴錯的 OIDC 權限
+
+jobs:
+  rescue_and_deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Repair Main Branch
+        run: |
+          git config user.name "GitHub Action"
+          git config user.email "action@github.com"
+          
+          # 切換到 main
+          git checkout main
+
+          # 長回資料夾並精準拿回 public/assets
+          mkdir -p public/assets
+          git checkout auto -- public/assets
+
+          # 長回資料夾並精準拿回 deploy.yml
+          mkdir -p .github/workflows
+          git checkout auto -- .github/workflows/deploy.yml 
+          
+          
+          # 自動修正 vite.config.ts (加入 base)
+          sed -i "/base:/d" vite.config.ts
+          sed -i "/plugins: \[/i \  base: '/Morimori/'," vite.config.ts
+          
+          # 把修復結果存回 main (存檔備份)
+          git add vite.config.ts
+          git commit -m "Rescue: Fixed base path" || echo "No changes"
+          git push origin main
