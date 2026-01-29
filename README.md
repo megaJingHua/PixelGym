@@ -1,7 +1,7 @@
 
-  # Fitness Tracker App
+  # PixelGym
 
-  This is a code bundle for Fitness Tracker App. The original project is available at https://www.figma.com/design/CWWxFshxzRf1lAUZzEjxXK/Fitness-Tracker-App.
+  This is a code bundle for PixelGym. The original project is available at https://www.figma.com/design/CWWxFshxzRf1lAUZzEjxXK/PixelGym.
 
   ## Running the code
 

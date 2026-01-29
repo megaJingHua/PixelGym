@@ -3,7 +3,7 @@ import { PixelCard } from '@/app/components/PixelCard';
 import { PixelButton } from '@/app/components/PixelButton';
 import { PixelInput } from '@/app/components/PixelInput';
 import { PixelBadge } from '@/app/components/PixelBadge';
-import { Dumbbell, Trophy, BookOpen, User, Plus, Sword, LogOut, Flame, Share2, Camera, Eye, EyeOff, Trash2, MessageSquare, Star, Settings, X } from 'lucide-react';
+import { Dumbbell, Trophy, BookOpen, User, Plus, Sword, LogOut, Flame, Share2, Camera, Eye, EyeOff, Trash2, MessageSquare, Star, Settings, X, CheckCircle, ChevronDown, ChevronUp } from 'lucide-react';
 import { format } from 'date-fns';
 import { ImageWithFallback } from '@/app/components/figma/ImageWithFallback';
 import { createClient } from '@supabase/supabase-js';
@@ -50,6 +50,7 @@ interface Log {
   score?: number;
   coachComment?: string;
   coachIdWhoCommented?: string;
+  coachCommentDate?: Date;
   isHidden?: boolean;
 }
 
@@ -77,6 +78,7 @@ interface Battle {
   likedBy?: string[];
   routine: string[];
   comments?: BattleComment[];
+  createdAt?: Date;
 }
 
 // API Helper
@@ -175,7 +177,10 @@ const api = {
     const token = session?.access_token || publicAnonKey;
     const res = await fetch(`${API_URL}/battles/${id}/like`, {
       method: 'POST',
-      headers: { Authorization: `Bearer ${token}` }
+      headers: { 
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}` 
+      }
     });
     return res.json();
   },
@@ -200,8 +205,15 @@ export default function App() {
   const [isRegistering, setIsRegistering] = useState(false);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [settingsForm, setSettingsForm] = useState({ email: '', password: '' });
-  const [adminLogFilter, setAdminLogFilter] = useState<'all' | 'my'>('my');
   const [adminManageFilter, setAdminManageFilter] = useState<'all' | 'my'>('all');
+  const [expandedLogs, setExpandedLogs] = useState<string[]>([]);
+  const hasInitializedLogState = React.useRef(false);
+
+  const toggleLogExpansion = (id: string) => {
+     setExpandedLogs(prev => 
+       prev.includes(id) ? prev.filter(p => p !== id) : [...prev, id]
+     );
+  };
   
   // Data State
   const [logs, setLogs] = useState<Log[]>([]);
@@ -498,13 +510,15 @@ export default function App() {
   };
 
   const updateLogFeedback = async (id: string, score: number | undefined, comment: string) => {
-    await api.updateLog(id, { score, coachComment: comment, coachIdWhoCommented: currentUser?.id });
+    const now = new Date();
+    await api.updateLog(id, { score, coachComment: comment, coachIdWhoCommented: currentUser?.id, coachCommentDate: now });
     setLogs(logs.map(log => 
       log.id === id ? { 
         ...log, 
         score, 
         coachComment: comment,
-        coachIdWhoCommented: currentUser?.id 
+        coachIdWhoCommented: currentUser?.id,
+        coachCommentDate: now
       } : log
     ));
     alert('評分與備註已更新！');
@@ -520,7 +534,8 @@ export default function App() {
       author: currentUser?.name || 'Anonymous',
       title: newBattle.title,
       likes: 0,
-      routine: newBattle.routine.split('\n').filter(line => line.trim() !== '')
+      routine: newBattle.routine.split('\n').filter(line => line.trim() !== ''),
+      createdAt: new Date()
     };
 
     await api.createBattle(battle);
@@ -555,25 +570,36 @@ export default function App() {
   const getVisibleLogs = () => {
     if (!currentUser) return [];
 
+    let filteredLogs = [];
+
     if (currentUser.role === 'student') {
-      return logs.filter(log => log.studentId === currentUser.id);
-    }
-    
-    // Super Admin (iisa)
-    if (currentUser.name === 'iisa') {
-      if (adminLogFilter === 'all') return logs;
-      // 'my' filter for Admin means students assigned to Admin (if any)
-      // Usually Admin might not have students, but if they do:
-      const myStudents = users.filter(u => u.coachId === currentUser.id).map(u => u.id);
-      return logs.filter(log => myStudents.includes(log.studentId));
+      filteredLogs = logs.filter(log => log.studentId === currentUser.id);
+    } else {
+      // Coach (including Super Admin iisa acting as Coach)
+      // Only see logs from students assigned to this coach
+      filteredLogs = logs.filter(log => {
+        const student = users.find(u => u.id === log.studentId);
+        return student && student.coachId === currentUser.id;
+      });
     }
 
-    // Regular Coach sees only their assigned students' logs
-    return logs.filter(log => {
-      const student = users.find(u => u.id === log.studentId);
-      return student && student.coachId === currentUser.id;
+    // Sort by date descending (Newest first)
+    return filteredLogs.sort((a, b) => {
+        const dateA = new Date(a.date).getTime();
+        const dateB = new Date(b.date).getTime();
+        return dateB - dateA;
     });
   };
+
+  useEffect(() => {
+    if (!isLoading && currentUser && logs.length > 0 && !hasInitializedLogState.current) {
+      const visible = getVisibleLogs();
+      if (visible.length > 0) {
+         setExpandedLogs([visible[0].id]);
+      }
+      hasInitializedLogState.current = true;
+    }
+  }, [isLoading, currentUser, logs]);
 
   // Render Functions
   if (isLoading) {
@@ -826,16 +852,6 @@ export default function App() {
              </button>
             </>
           )}
-          
-          {currentUser.name === 'iisa' && (
-             <button 
-             onClick={() => setActiveTab('export')}
-             className={`flex items-center gap-2 px-6 py-3 font-bold border-4 transition-all ${activeTab === 'export' ? 'bg-[#9333ea] text-white border-black shadow-[4px_4px_0_0_black] -translate-y-1' : 'bg-gray-100 border-transparent text-gray-500 hover:bg-gray-200'}`}
-           >
-             <Share2 className="w-5 h-5" />
-             記錄匯出
-           </button>
-          )}
         </div>
       </nav>
 
@@ -979,23 +995,6 @@ export default function App() {
                        <User className="w-5 h-5"/> 學員菜單審核 (Student Logs)
                     </h3>
                     
-                    {currentUser.name === 'iisa' && (
-                      <div className="flex gap-2">
-                         <button 
-                           onClick={() => setAdminLogFilter('my')}
-                           className={`px-3 py-1 text-xs font-bold border-2 border-black ${adminLogFilter === 'my' ? 'bg-[#ffcd38] text-black' : 'bg-white text-gray-500'}`}
-                         >
-                           我的學員
-                         </button>
-                         <button 
-                           onClick={() => setAdminLogFilter('all')}
-                           className={`px-3 py-1 text-xs font-bold border-2 border-black ${adminLogFilter === 'all' ? 'bg-[#ffcd38] text-black' : 'bg-white text-gray-500'}`}
-                         >
-                           全部學員
-                         </button>
-                      </div>
-                    )}
-                    
                     <PixelBadge>{getVisibleLogs().filter(l => !l.coachComment && l.score === undefined).length} 待審核</PixelBadge>
                   </div>
                   
@@ -1008,38 +1007,54 @@ export default function App() {
                       const student = users.find(u => u.id === log.studentId);
                       const currentCoach = users.find(u => u.id === student?.coachId);
                       const commentingCoach = users.find(u => u.id === log.coachIdWhoCommented);
+                      const isExpanded = expandedLogs.includes(log.id);
                       
                       return (
                       <div key={log.id} className={`transition-all ${log.isHidden ? 'opacity-50 grayscale' : ''}`}>
-                         <PixelCard className="border-black border-4 shadow-[6px_6px_0_0_rgba(0,0,0,0.2)] p-0 overflow-hidden relative">
+                         <PixelCard className={`border-black border-4 shadow-[6px_6px_0_0_rgba(0,0,0,0.2)] p-0 overflow-hidden relative ${!isExpanded ? 'bg-gray-50' : ''}`}>
                             {/* Header Bar */}
-                            <div className="bg-gray-900 text-white p-3 flex justify-between items-center">
+                            <div 
+                              className="bg-gray-900 text-white p-3 flex justify-between items-center cursor-pointer hover:bg-gray-800 transition-colors"
+                              onClick={() => toggleLogExpansion(log.id)}
+                            >
                                <div className="flex items-center gap-2">
                                   <div className="w-8 h-8 bg-[#4ecdc4] rounded-full border-2 border-white flex items-center justify-center text-black font-bold">
                                     {student?.name[0] || '?'}
                                   </div>
-                                  <div>
-                                    <span className="font-bold block">{student?.name}</span>
+                                  <div className="flex flex-col">
+                                    <span className="font-bold block text-sm">{student?.name}</span>
+                                    {/* Collapsed Summary */}
+                                    {!isExpanded && (
+                                       <span className="text-[10px] text-gray-400 font-mono">
+                                          {format(log.date, 'MM/dd')} • {log.items.length} Items ({log.items.map(i => i.exercise).slice(0, 2).join(', ')}{log.items.length > 2 ? '...' : ''})
+                                       </span>
+                                    )}
                                     {/* Super Admin sees which coach is assigned */}
-                                    {currentUser.name === 'iisa' && currentCoach && (
+                                    {isExpanded && currentUser.name === 'iisa' && currentCoach && (
                                         <span className="text-[10px] text-[#ffcd38] flex items-center gap-1">
                                             <User size={10} /> Coach: {currentCoach.name}
                                         </span>
                                     )}
                                   </div>
                                </div>
-                               <div className="flex gap-2">
-                                  <button onClick={() => toggleHideLog(log.id)} className="hover:text-[#4ecdc4] transition-colors" title={log.isHidden ? "顯示" : "隱藏"}>
-                                     {log.isHidden ? <EyeOff size={18} /> : <Eye size={18} />}
-                                  </button>
-                                  <button onClick={() => deleteLog(log.id)} className="hover:text-[#ff6b6b] transition-colors" title="刪除">
-                                     <Trash2 size={18} />
-                                  </button>
+                               <div className="flex gap-2 items-center">
+                                  <div className="flex gap-2 mr-2">
+                                    <button onClick={(e) => { e.stopPropagation(); toggleHideLog(log.id); }} className="hover:text-[#4ecdc4] transition-colors" title={log.isHidden ? "顯示" : "隱藏"}>
+                                       {log.isHidden ? <EyeOff size={18} /> : <Eye size={18} />}
+                                    </button>
+                                    <button onClick={(e) => { e.stopPropagation(); deleteLog(log.id); }} className="hover:text-[#ff6b6b] transition-colors" title="刪除">
+                                       <Trash2 size={18} />
+                                    </button>
+                                  </div>
+                                  <div className="text-gray-500">
+                                    {isExpanded ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}
+                                  </div>
                                </div>
                             </div>
                             
                             {/* Content */}
-                            <div className="p-4">
+                            {isExpanded && (
+                            <div className="p-4 animate-in slide-in-from-top-2 duration-200">
                                <div className="mb-4 flex justify-between items-center border-b-2 border-gray-100 pb-2">
                                   <span className="font-bold text-lg text-gray-800">健身日記</span>
                                   <div className="text-xs font-mono text-gray-400">
@@ -1068,50 +1083,72 @@ export default function App() {
                                </div>
 
                                {/* Coach Feedback Section */}
-                               <div className="border-t-2 border-dashed border-gray-300 pt-4 mt-2">
-                                  <div className="flex flex-col gap-3">
-                                     {log.coachComment && commentingCoach && currentUser.name === 'iisa' && (
-                                         <div className="text-[10px] text-gray-400 font-bold mb-1">
-                                             Rated by: {commentingCoach.name}
+                               {(() => {
+                                 const isGraded = log.score !== undefined || !!log.coachComment;
+                                 
+                                 return (
+                                   <div className={`border-t-2 border-dashed ${isGraded ? 'border-[#4ecdc4] bg-[#e6fffa]' : 'border-gray-300'} pt-4 mt-2 p-3 -mx-3 transition-colors`}>
+                                      <div className="flex flex-col gap-3">
+                                         {isGraded && (
+                                            <div className="flex items-center gap-2 mb-1 text-[#2c7a7b] font-bold text-xs uppercase tracking-wider">
+                                               <CheckCircle className="w-4 h-4" /> 
+                                               <span>已完成評分 (Graded)</span>
+                                               {commentingCoach && (
+                                                  <span className="text-gray-500 font-normal normal-case">- by {commentingCoach.name}</span>
+                                               )}
+                                               {log.coachCommentDate && (
+                                                  <span className="text-gray-400 font-normal normal-case text-[10px] ml-auto">
+                                                     {format(new Date(log.coachCommentDate), 'MM/dd HH:mm')}
+                                                  </span>
+                                               )}
+                                            </div>
+                                         )}
+                                         
+                                         <div className="flex items-center gap-4">
+                                            <label className="font-bold text-sm flex items-center gap-1">
+                                               <Star className={`w-4 h-4 ${isGraded ? 'text-[#38b2ac]' : 'text-[#ffcd38]'} fill-current`} /> 評分:
+                                            </label>
+                                            <input 
+                                               type="number" 
+                                               min="0" 
+                                               max="100" 
+                                               defaultValue={log.score}
+                                               className={`w-20 border-2 ${isGraded ? 'border-[#38b2ac]' : 'border-black'} p-1 text-center font-bold bg-white`}
+                                               placeholder="0-100"
+                                               id={`score-${log.id}`}
+                                            />
                                          </div>
-                                     )}
-                                     
-                                     <div className="flex items-center gap-4">
-                                        <label className="font-bold text-sm flex items-center gap-1">
-                                           <Star className="w-4 h-4 text-[#ffcd38] fill-current" /> 評分:
-                                        </label>
-                                        <input 
-                                           type="number" 
-                                           min="0" 
-                                           max="100" 
-                                           defaultValue={log.score}
-                                           className="w-20 border-2 border-black p-1 text-center font-bold"
-                                           placeholder="0-100"
-                                           id={`score-${log.id}`}
-                                        />
-                                     </div>
-                                     <div className="flex gap-2">
-                                        <input 
-                                           type="text" 
-                                           defaultValue={log.coachComment}
-                                           className="flex-1 border-2 border-gray-300 p-2 text-sm focus:border-black outline-none"
-                                           placeholder="給予指導建議..."
-                                           id={`comment-${log.id}`}
-                                        />
-                                        <PixelButton 
-                                           size="sm" 
-                                           onClick={() => {
-                                              const scoreInput = document.getElementById(`score-${log.id}`) as HTMLInputElement;
-                                              const commentInput = document.getElementById(`comment-${log.id}`) as HTMLInputElement;
-                                              updateLogFeedback(log.id, Number(scoreInput.value), commentInput.value);
-                                           }}
-                                        >
-                                           <MessageSquare className="w-4 h-4" /> 評分
-                                        </PixelButton>
-                                     </div>
-                                  </div>
-                               </div>
+                                         <div className="flex gap-2">
+                                            <input 
+                                               type="text" 
+                                               defaultValue={log.coachComment}
+                                               className={`flex-1 border-2 ${isGraded ? 'border-[#38b2ac]' : 'border-gray-300'} p-2 text-sm focus:border-black outline-none bg-white`}
+                                               placeholder="給予指導建議..."
+                                               id={`comment-${log.id}`}
+                                            />
+                                            <PixelButton 
+                                               size="sm" 
+                                               variant={isGraded ? 'outline' : 'primary'}
+                                               className={isGraded ? 'bg-white text-[#2c7a7b] border-[#2c7a7b] hover:bg-[#e6fffa]' : ''}
+                                               onClick={() => {
+                                                  const scoreInput = document.getElementById(`score-${log.id}`) as HTMLInputElement;
+                                                  const commentInput = document.getElementById(`comment-${log.id}`) as HTMLInputElement;
+                                                  updateLogFeedback(log.id, Number(scoreInput.value), commentInput.value);
+                                               }}
+                                            >
+                                               {isGraded ? (
+                                                 <><MessageSquare className="w-4 h-4" /> 更新</>
+                                               ) : (
+                                                 <><MessageSquare className="w-4 h-4" /> 評分</>
+                                               )}
+                                            </PixelButton>
+                                         </div>
+                                      </div>
+                                   </div>
+                                 );
+                               })()}
                             </div>
+                            )}
                          </PixelCard>
                       </div>
                     )})
@@ -1126,71 +1163,109 @@ export default function App() {
                       尚無記錄，快開始鍛鍊吧！
                     </div>
                   ) : (
-                    getVisibleLogs().map(log => (
-                      <div key={log.id} className="bg-white border-2 border-black p-4 shadow-[4px_4px_0_0_rgba(0,0,0,0.1)]">
-                        <div className="flex justify-between items-center mb-4 border-b pb-2">
-                           <div className="flex items-center gap-2">
-                              <span className="font-bold text-lg text-gray-800">Workout Session</span>
+                    getVisibleLogs().map(log => {
+                      const isExpanded = expandedLogs.includes(log.id);
+                      
+                      return (
+                      <div key={log.id} className="bg-white border-2 border-black shadow-[4px_4px_0_0_rgba(0,0,0,0.1)] overflow-hidden">
+                        {/* Header / Summary - Always Visible */}
+                        <div 
+                           className="flex justify-between items-center p-4 border-b border-gray-100 cursor-pointer hover:bg-gray-50 transition-colors"
+                           onClick={() => toggleLogExpansion(log.id)}
+                        >
+                           <div className="flex flex-col gap-1">
+                              <div className="flex items-center gap-2">
+                                 <span className="font-bold text-lg text-gray-800">Workout Session</span>
+                                 {!isExpanded && (
+                                   <span className="text-xs text-gray-400 font-mono hidden md:inline-block">
+                                      • {log.items.length} Items ({log.items.map(i => i.exercise).slice(0, 2).join(', ')}{log.items.length > 2 ? '...' : ''})
+                                   </span>
+                                 )}
+                              </div>
+                              <span className="text-xs font-mono text-gray-400">{format(log.date, 'yyyy/MM/dd HH:mm')}</span>
+                              
+                              {/* Mobile Summary */}
+                              {!isExpanded && (
+                                 <div className="text-xs text-gray-400 font-mono md:hidden mt-1">
+                                    {log.items.length} Items: {log.items.map(i => i.exercise).slice(0, 1).join(', ')}{log.items.length > 1 ? '...' : ''}
+                                 </div>
+                              )}
+                           </div>
+                           
+                           <div className="flex items-center gap-3">
+                              {/* Always show delete button for owner if needed, or hide inside expanded? Keeping it accessible is good but might clutter. Let's keep it here. */}
                               {(currentUser.id === log.studentId || currentUser.role === 'coach') && (
                                 <button 
                                   onClick={(e) => { e.stopPropagation(); deleteLog(log.id); }}
-                                  className="text-gray-400 hover:text-red-500 transition-colors"
+                                  className="text-gray-300 hover:text-red-500 transition-colors"
                                   title="Delete Log"
                                 >
                                   <Trash2 className="w-4 h-4" />
                                 </button>
                               )}
+                              <div className="text-gray-400">
+                                 {isExpanded ? <ChevronUp className="w-5 h-5" /> : <ChevronDown className="w-5 h-5" />}
+                              </div>
                            </div>
-                           <span className="text-xs font-mono text-gray-400">{format(log.date, 'MM/dd HH:mm')}</span>
                         </div>
                         
-                        <div className="space-y-2 mb-4">
-                           {log.items.map((item, idx) => (
-                              <div key={item.id} className="flex justify-between items-center text-sm border-b border-gray-100 last:border-0 py-1">
-                                 <div className="flex items-center gap-2">
-                                    <span className="text-gray-300 font-bold w-4">{idx + 1}.</span>
-                                    <span className="font-bold">{item.exercise}</span>
-                                    <span className="text-xs bg-gray-100 px-1 rounded text-gray-500">{item.muscle}</span>
-                                 </div>
-                                 <div className="font-mono text-gray-600">
-                                    {item.weight}kg x {item.reps}
-                                 </div>
-                              </div>
-                           ))}
-                        </div>
-
-                        {log.notes && (
-                           <div className="text-xs text-gray-500 bg-gray-50 p-2 border border-gray-200 italic mb-2">
-                              "{log.notes}"
-                           </div>
-                        )}
-
-                        {/* Coach Feedback for Student */}
-                        {(log.coachComment || log.score !== undefined) && (
-                           <div className="mt-4 pt-3 border-t-2 border-dashed border-black bg-[#fff5f5] -mx-4 px-4 pb-2">
-                              <div className="flex items-center gap-2 mb-1">
-                                 <User className="w-4 h-4 text-[#ff6b6b]" />
-                                 <span className="font-bold text-sm text-[#ff6b6b]">教練回饋 (Coach Feedback)</span>
-                              </div>
-                              
-                              <div className="flex items-start gap-3">
-                                 {log.score !== undefined && (
-                                    <div className="flex flex-col items-center bg-white border-2 border-[#ff6b6b] p-1 min-w-[50px]">
-                                       <Star className="w-4 h-4 text-[#ffcd38] fill-current" />
-                                       <span className="font-bold text-lg leading-none mt-1">{log.score}</span>
+                        {/* Expanded Content */}
+                        {isExpanded && (
+                        <div className="p-4 animate-in slide-in-from-top-2 duration-200">
+                           <div className="space-y-2 mb-4">
+                              {log.items.map((item, idx) => (
+                                 <div key={item.id} className="flex justify-between items-center text-sm border-b border-gray-100 last:border-0 py-1">
+                                    <div className="flex items-center gap-2">
+                                       <span className="text-gray-300 font-bold w-4">{idx + 1}.</span>
+                                       <span className="font-bold">{item.exercise}</span>
+                                       <span className="text-xs bg-gray-100 px-1 rounded text-gray-500">{item.muscle}</span>
                                     </div>
-                                 )}
+                                    <div className="font-mono text-gray-600">
+                                       {item.weight}kg x {item.reps}
+                                    </div>
+                                 </div>
+                              ))}
+                           </div>
+   
+                           {log.notes && (
+                              <div className="text-xs text-gray-500 bg-gray-50 p-2 border border-gray-200 italic mb-2">
+                                 "{log.notes}"
+                              </div>
+                           )}
+   
+                           {/* Coach Feedback for Student */}
+                           {(log.coachComment || log.score !== undefined) && (
+                              <div className="mt-4 pt-3 border-t-2 border-dashed border-black bg-[#fff5f5] -mx-4 px-4 pb-2">
+                                 <div className="flex items-center gap-2 mb-1">
+                                    <User className="w-4 h-4 text-[#ff6b6b]" />
+                                    <span className="font-bold text-sm text-[#ff6b6b]">教練回饋 (Coach Feedback)</span>
+                                    {log.coachCommentDate && (
+                                       <span className="text-gray-400 font-normal normal-case text-[10px] ml-auto">
+                                          {format(new Date(log.coachCommentDate), 'MM/dd HH:mm')}
+                                       </span>
+                                    )}
+                                 </div>
                                  
-                                 {log.coachComment && (
-                                    <div className="text-sm text-gray-700 py-1 font-bold">
-                                       {log.coachComment}
-                                    </div>
-                                 )}
+                                 <div className="flex items-start gap-3">
+                                    {log.score !== undefined && (
+                                       <div className="flex flex-col items-center bg-white border-2 border-[#ff6b6b] p-1 min-w-[50px]">
+                                          <Star className="w-4 h-4 text-[#ffcd38] fill-current" />
+                                          <span className="font-bold text-lg leading-none mt-1">{log.score}</span>
+                                       </div>
+                                    )}
+                                    
+                                    {log.coachComment && (
+                                       <div className="text-sm text-gray-700 py-1 font-bold">
+                                          {log.coachComment}
+                                       </div>
+                                    )}
+                                 </div>
                               </div>
-                           </div>
+                           )}
+                        </div>
                         )}
                       </div>
-                    ))
+                    )})
                   )}
                 </div>
               )}
@@ -1361,9 +1436,9 @@ export default function App() {
                           : 'border-black shadow-[6px_6px_0px_0px_#ff6b6b]'
                       }`}>
                       <div className={`absolute -top-3 -right-3 border-2 border-black px-2 py-1 font-bold text-xs shadow-sm ${
-                        isMyBattle ? 'bg-[#4ecdc4] text-white' : 'bg-[#ffcd38] text-black'
+                        isMyBattle ? 'bg-[#4ecdc4] text-white' : 'bg-[#fff] text-gray-500'
                       }`}>
-                        {isMyBattle ? 'MY BATTLE' : 'LV.5 難度'}
+                        {isMyBattle ? 'MY BATTLE' : (battle.createdAt ? format(new Date(battle.createdAt), 'yyyy/MM/dd') : 'CHALLENGE')}
                       </div>
                       
                       <div className="flex justify-between items-start mb-4">
@@ -1413,15 +1488,22 @@ export default function App() {
                           <div className="space-y-2 mb-3 max-h-40 overflow-y-auto pr-2 custom-scrollbar">
                             {battle.comments.map(comment => (
                               <div key={comment.id} className="bg-gray-50 p-2 text-xs border border-gray-200 rounded-sm">
-                                <div className="flex justify-between items-center mb-1">
-                                   <span className={`font-bold ${comment.author === currentUser?.name ? 'text-[#ff6b6b]' : 'text-gray-700'}`}>
-                                      {comment.author}
-                                   </span>
+                                <div className="flex justify-between items-center mb-1 border-b border-gray-100 pb-1">
+                                   <div className="flex items-center gap-2">
+                                       <div className={`w-5 h-5 rounded-full flex items-center justify-center text-[10px] font-bold text-white ${
+                                           comment.author === currentUser?.name ? 'bg-[#ff6b6b]' : 'bg-gray-400'
+                                       }`}>
+                                           {comment.author[0].toUpperCase()}
+                                       </div>
+                                       <span className={`font-bold ${comment.author === currentUser?.name ? 'text-[#ff6b6b]' : 'text-gray-700'}`}>
+                                          {comment.author}:
+                                       </span>
+                                   </div>
                                    <span className="text-gray-400 text-[10px]">
                                      {format(new Date(comment.date), 'MM/dd HH:mm')}
                                    </span>
                                 </div>
-                                <p className="text-gray-600 break-words">{comment.content}</p>
+                                <p className="text-gray-600 break-words pl-7 font-medium">{comment.content}</p>
                               </div>
                             ))}
                           </div>
@@ -1464,71 +1546,156 @@ export default function App() {
 
         {/* ADMIN TAB */}
         {/* ADMIN TAB (Regular Coach & Admin Personal View) */}
-        {activeTab === 'admin' && currentUser.role === 'coach' && (
+        {activeTab === 'admin' && (currentUser.role === 'coach' || currentUser.name === 'iisa') && (
            <div className="space-y-6 animate-in slide-in-from-right-4 duration-500">
                 <div className="space-y-6">
                   <div className="flex justify-between items-center border-b-4 border-black pb-4">
                      <h2 className="text-2xl font-bold text-[#4ecdc4] flex items-center gap-2">
                         <User className="w-8 h-8" /> 我的學員 (My Students)
                      </h2>
-                     <PixelBadge variant="accent" className="text-lg">
-                       {users.filter(u => u.coachId === currentUser.id).length} Students
-                     </PixelBadge>
+                     
+                     <div className="flex items-center gap-3">
+                       {currentUser.name === 'iisa' && (
+                         <div className="flex bg-gray-200 p-1 rounded">
+                           <button 
+                             onClick={() => setAdminManageFilter('my')}
+                             className={`px-3 py-1 text-xs font-bold rounded ${adminManageFilter === 'my' ? 'bg-white shadow text-black' : 'text-gray-500'}`}
+                           >
+                             我的 ({users.filter(u => u.coachId === currentUser.id).length})
+                           </button>
+                           <button 
+                             onClick={() => setAdminManageFilter('all')}
+                             className={`px-3 py-1 text-xs font-bold rounded ${adminManageFilter === 'all' ? 'bg-white shadow text-black' : 'text-gray-500'}`}
+                           >
+                             全部 ({users.filter(u => u.role === 'student').length})
+                           </button>
+                         </div>
+                       )}
+                       <PixelBadge variant="accent" className="text-lg">
+                         {currentUser.name === 'iisa' && adminManageFilter === 'all' 
+                           ? users.filter(u => u.role === 'student').length 
+                           : users.filter(u => u.coachId === currentUser.id).length} Students
+                       </PixelBadge>
+                     </div>
                   </div>
 
-                  <div className="grid md:grid-cols-2 gap-6">
-                     {users.filter(u => u.coachId === currentUser.id).length === 0 ? (
-                         <div className="col-span-2 text-center py-10 border-4 border-dashed border-gray-300 rounded bg-gray-50">
-                           <User className="w-12 h-12 mx-auto text-gray-300 mb-2" />
-                           <p className="text-gray-500 font-bold">目前尚未指派學員給您</p>
-                           <p className="text-xs text-gray-400 mt-1">請聯繫管理員 (iisa) 進行分發</p>
-                         </div>
-                     ) : (
-                         users.filter(u => u.coachId === currentUser.id).map(u => (
-                           <div key={u.id} className={`bg-white border-4 border-black p-4 shadow-[4px_4px_0_0_rgba(0,0,0,0.1)] relative overflow-hidden ${u.status === 'disabled' ? 'grayscale opacity-75' : ''}`}>
-                               {u.status === 'disabled' && (
+                  <div className="grid md:grid-cols-2 lg:grid-cols-3 gap-6">
+                     {(() => {
+                       const targetStudents = currentUser.name === 'iisa' && adminManageFilter === 'all'
+                         ? users.filter(u => u.role === 'student')
+                         : users.filter(u => u.coachId === currentUser.id);
+
+                       if (targetStudents.length === 0) {
+                         return (
+                           <div className="col-span-3 text-center py-10 border-4 border-dashed border-gray-300 rounded bg-gray-50">
+                             <User className="w-12 h-12 mx-auto text-gray-300 mb-2" />
+                             <p className="text-gray-500 font-bold">目前無學員 (No Students)</p>
+                           </div>
+                         );
+                       }
+
+                       return targetStudents.map(student => {
+                         const studentLogs = logs.filter(l => l.studentId === student.id);
+                         const totalWorkouts = studentLogs.length;
+                         const lastWorkout = studentLogs.length > 0 ? studentLogs[0].date : null;
+                         
+                         // Calculate Badges
+                         const badges = [];
+                         if (totalWorkouts >= 1) badges.push({ icon: '🏅', name: '新手上路', color: 'bg-green-100 text-green-700' });
+                         if (totalWorkouts >= 10) badges.push({ icon: '🥉', name: '持之以恆', color: 'bg-orange-100 text-orange-700' });
+                         if (totalWorkouts >= 30) badges.push({ icon: '🥈', name: '健身運動員', color: 'bg-gray-100 text-gray-700' });
+                         if (totalWorkouts >= 50) badges.push({ icon: '🥇', name: '健身菁英', color: 'bg-yellow-100 text-yellow-700' });
+                         
+                         // Heavy Lifter Check
+                         const maxWeight = studentLogs.reduce((max, log) => {
+                            const logMax = log.items.reduce((m, i) => Math.max(m, i.weight), 0);
+                            return Math.max(max, logMax);
+                         }, 0);
+                         
+                         if (maxWeight >= 100) badges.push({ icon: '💪', name: '大��士', color: 'bg-red-100 text-red-700' });
+
+                         return (
+                           <div key={student.id} className={`bg-white border-4 border-black p-4 shadow-[4px_4px_0_0_rgba(0,0,0,0.1)] relative overflow-hidden flex flex-col ${student.status === 'disabled' ? 'grayscale opacity-75' : ''}`}>
+                               {student.status === 'disabled' && (
                                  <div className="absolute top-0 right-0 bg-red-500 text-white text-[10px] px-2 py-1 font-bold">
                                    DISABLED
                                  </div>
                                )}
                                
-                               <div className="flex items-center gap-4 mb-4">
-                                 <div className={`w-12 h-12 rounded-full border-2 border-black flex items-center justify-center font-bold text-xl ${u.status === 'active' ? 'bg-[#4ecdc4] text-white' : 'bg-gray-300 text-gray-500'}`}>
-                                   {u.name[0].toUpperCase()}
+                               <div className="flex items-center gap-4 mb-4 border-b-2 border-dashed border-gray-200 pb-4">
+                                 <div className={`w-12 h-12 rounded-full border-2 border-black flex items-center justify-center font-bold text-xl ${student.status === 'active' ? 'bg-[#9333ea] text-white' : 'bg-gray-300 text-gray-500'}`}>
+                                   {student.name[0].toUpperCase()}
                                  </div>
                                  <div>
-                                   <h3 className="font-bold text-lg">{u.name}</h3>
+                                   <h3 className="font-bold text-lg">{student.name}</h3>
                                    <div className="flex items-center gap-2 text-xs font-mono mt-1">
-                                      <div className={`w-2 h-2 rounded-full ${u.status === 'active' ? 'bg-green-500 animate-pulse' : 'bg-red-500'}`}></div>
-                                      <span className="uppercase">{u.status}</span>
+                                      <div className={`w-2 h-2 rounded-full ${student.status === 'active' ? 'bg-green-500 animate-pulse' : 'bg-red-500'}`}></div>
+                                      <span className="uppercase">{student.status}</span>
+                                      {currentUser.name === 'iisa' && adminManageFilter === 'all' && student.coachId && (
+                                        <span className="bg-gray-100 px-1 rounded text-gray-500 ml-1">
+                                          Coach: {users.find(u => u.id === student.coachId)?.name}
+                                        </span>
+                                      )}
                                    </div>
                                  </div>
                                </div>
 
-                               <div className="bg-gray-100 p-3 text-xs space-y-2 border border-gray-200">
-                                 <div className="flex justify-between">
-                                   <span className="text-gray-500">最近運動:</span>
-                                   <span className="font-bold">
-                                     {getVisibleLogs().filter(l => l.studentId === u.id).length > 0 
-                                       ? format(getVisibleLogs().filter(l => l.studentId === u.id)[0].date, 'MM/dd')
-                                       : 'N/A'
-                                     }
-                                   </span>
+                               {/* Stats Grid */}
+                               <div className="grid grid-cols-2 gap-2 mb-4 text-center">
+                                 <div className="bg-gray-50 p-2 border border-gray-200">
+                                    <div className="text-xs text-gray-400 font-bold uppercase">Workouts</div>
+                                    <div className="text-xl font-bold text-[#9333ea]">{totalWorkouts}</div>
                                  </div>
-                                 <div className="flex justify-between">
-                                   <span className="text-gray-500">總記錄:</span>
-                                   <span className="font-bold">{getVisibleLogs().filter(l => l.studentId === u.id).length}</span>
+                                 <div className="bg-gray-50 p-2 border border-gray-200">
+                                    <div className="text-xs text-gray-400 font-bold uppercase">Max Weight</div>
+                                    <div className="text-xl font-bold text-gray-700">{maxWeight}kg</div>
                                  </div>
                                </div>
                                
-                               <div className="mt-4 pt-4 border-t-2 border-black">
+                               {/* Badges Preview (Mini) */}
+                               <div className="mb-4 flex-1">
+                                 <div className="text-xs font-bold text-gray-400 mb-2 uppercase">Achievements</div>
+                                 <div className="flex flex-wrap gap-1">
+                                    {badges.length === 0 ? (
+                                       <span className="text-xs text-gray-300 italic">尚無成就</span>
+                                    ) : (
+                                       badges.map((b, i) => (
+                                          <span key={i} className={`text-[10px] font-bold px-1.5 py-0.5 rounded border border-black/10 flex items-center gap-1 ${b.color}`} title={b.name}>
+                                             {b.icon} {b.name}
+                                          </span>
+                                       ))
+                                    )}
+                                 </div>
+                               </div>
+
+                               <div className="mt-auto space-y-2 pt-4 border-t-2 border-black">
                                  <PixelButton size="sm" className="w-full" onClick={() => setActiveTab('log')}>
-                                   查看日記 (View Logs)
+                                   <BookOpen className="w-4 h-4 mr-2" /> 查看日記 (View Logs)
+                                 </PixelButton>
+                                 <PixelButton 
+                                    size="sm"
+                                    variant="outline"
+                                    className="w-full bg-white hover:bg-purple-50 hover:text-purple-600 hover:border-purple-600"
+                                    onClick={() => {
+                                       alert(`
+=== PIXEL GYM REPORT ===
+Student: ${student.name}
+Total Workouts: ${totalWorkouts}
+Max Weight: ${maxWeight}kg
+Badges: ${badges.map(b => b.name).join(', ')}
+Last Active: ${lastWorkout ? format(lastWorkout, 'yyyy-MM-dd') : 'Never'}
+========================
+(已傳送至後台列印佇列)
+                                       `);
+                                    }}
+                                 >
+                                    <Share2 className="w-4 h-4 mr-2" /> 匯出數據 (Export)
                                  </PixelButton>
                                </div>
                            </div>
-                         ))
-                     )}
+                         );
+                       });
+                     })()}
                   </div>
                 </div>
            </div>
@@ -1696,103 +1863,103 @@ export default function App() {
                   </div>
                 </div>
              </div>
-           </div>
-        )}
-        {/* ADMIN EXPORT TAB */}
-        {activeTab === 'export' && currentUser.name === 'iisa' && (
-          <div className="space-y-6 animate-in slide-in-from-right-4 duration-500">
-             <div className="border-b-4 border-black pb-4 mb-6">
-                <h2 className="text-2xl font-bold text-[#9333ea] flex items-center gap-2">
-                   <Share2 className="w-8 h-8" /> 學員成就匯出 (Export Center)
+             {/* 3. All Logs Monitor Section */}
+             <div className="space-y-6 pt-6 border-t-4 border-black">
+                <h2 className="text-2xl font-bold text-[#ff6b6b] flex items-center gap-2">
+                   <Eye className="w-8 h-8" /> 全校健身日記監控 (All Logs Monitor)
                 </h2>
-                <p className="text-gray-500 text-sm mt-1">產生學員的個人成就卡片與運動數據統計</p>
-             </div>
-
-             <div className="grid md:grid-cols-2 lg:grid-cols-3 gap-6">
-               {users.filter(u => u.role === 'student').map(student => {
-                 const studentLogs = logs.filter(l => l.studentId === student.id);
-                 const totalWorkouts = studentLogs.length;
-                 const lastWorkout = studentLogs.length > 0 ? studentLogs[0].date : null;
-                 
-                 // Calculate Badges
-                 const badges = [];
-                 if (totalWorkouts >= 1) badges.push({ icon: '🏅', name: '新手上路', color: 'bg-green-100 text-green-700' });
-                 if (totalWorkouts >= 10) badges.push({ icon: '🥉', name: '持之以恆', color: 'bg-orange-100 text-orange-700' });
-                 if (totalWorkouts >= 30) badges.push({ icon: '🥈', name: '健身運動員', color: 'bg-gray-100 text-gray-700' });
-                 if (totalWorkouts >= 50) badges.push({ icon: '🥇', name: '健身菁英', color: 'bg-yellow-100 text-yellow-700' });
-                 
-                 // Heavy Lifter Check
-                 const maxWeight = studentLogs.reduce((max, log) => {
-                    const logMax = log.items.reduce((m, i) => Math.max(m, i.weight), 0);
-                    return Math.max(max, logMax);
-                 }, 0);
-                 
-                 if (maxWeight >= 100) badges.push({ icon: '💪', name: '大力士', color: 'bg-red-100 text-red-700' });
-
-                 return (
-                   <PixelCard key={student.id} className="relative group hover:-translate-y-1 transition-transform">
-                      {/* Card Header */}
-                      <div className="flex items-center gap-4 mb-4 border-b-2 border-dashed border-gray-300 pb-4">
-                         <div className="w-16 h-16 bg-[#9333ea] border-2 border-black rounded-full flex items-center justify-center text-white text-2xl font-bold">
-                            {student.name[0].toUpperCase()}
-                         </div>
-                         <div>
-                            <h3 className="text-xl font-bold">{student.name}</h3>
-                            <div className="text-xs text-gray-500 font-mono">ID: {student.id.slice(0, 8)}</div>
-                         </div>
-                      </div>
-
-                      {/* Stats */}
-                      <div className="grid grid-cols-2 gap-2 mb-4 text-center">
-                         <div className="bg-gray-50 p-2 border border-gray-200">
-                            <div className="text-xs text-gray-400 font-bold uppercase">Workouts</div>
-                            <div className="text-xl font-bold text-[#9333ea]">{totalWorkouts}</div>
-                         </div>
-                         <div className="bg-gray-50 p-2 border border-gray-200">
-                            <div className="text-xs text-gray-400 font-bold uppercase">Max Weight</div>
-                            <div className="text-xl font-bold text-gray-700">{maxWeight}kg</div>
-                         </div>
-                      </div>
-
-                      {/* Badges Area */}
-                      <div className="mb-6">
-                         <div className="text-xs font-bold text-gray-400 mb-2 uppercase">Achievements ({badges.length})</div>
-                         <div className="flex flex-wrap gap-2">
-                            {badges.length === 0 ? (
-                               <span className="text-xs text-gray-300 italic">尚無成就...</span>
-                            ) : (
-                               badges.map((b, i) => (
-                                  <span key={i} className={`text-xs font-bold px-2 py-1 rounded border border-black/10 flex items-center gap-1 ${b.color}`}>
-                                     <span>{b.icon}</span> {b.name}
-                                  </span>
-                               ))
-                            )}
-                         </div>
-                      </div>
-
-                      <PixelButton 
-                        className="w-full" 
-                        variant="outline"
-                        onClick={() => {
-                           alert(`
-=== PIXEL GYM REPORT ===
-Student: ${student.name}
-Total Workouts: ${totalWorkouts}
-Max Weight: ${maxWeight}kg
-Badges: ${badges.map(b => b.name).join(', ')}
-Last Active: ${lastWorkout ? format(lastWorkout, 'yyyy-MM-dd') : 'Never'}
-========================
-(已傳送至後台列印佇列)
-                           `);
-                        }}
-                      >
-                         <Share2 className="w-4 h-4" /> 匯出數據卡 (Export)
-                      </PixelButton>
+                
+                {logs.length === 0 ? (
+                   <PixelCard className="text-center text-gray-400 py-10 border-dashed">
+                      目前沒有任何記錄
                    </PixelCard>
-                 );
-               })}
+                ) : (
+                   logs.map(log => {
+                      const student = users.find(u => u.id === log.studentId);
+                      const currentCoach = users.find(u => u.id === student?.coachId);
+                      const commentingCoach = users.find(u => u.id === log.coachIdWhoCommented);
+                      const isGraded = log.score !== undefined || !!log.coachComment;
+                      
+                      return (
+                      <div key={log.id} className={`transition-all ${log.isHidden ? 'opacity-50 grayscale' : ''}`}>
+                         <PixelCard className="border-gray-400 border-4 shadow-none p-0 overflow-hidden relative mb-4 bg-gray-50">
+                            {/* Header Bar */}
+                            <div className="bg-gray-200 text-gray-600 p-3 flex justify-between items-center border-b-2 border-gray-300">
+                               <div className="flex items-center gap-2">
+                                  <div className="w-8 h-8 bg-white rounded-full border-2 border-gray-400 flex items-center justify-center text-black font-bold text-xs">
+                                    {student?.name[0] || '?'}
+                                  </div>
+                                  <div>
+                                    <span className="font-bold block text-sm">{student?.name}</span>
+                                    {currentCoach && (
+                                        <span className="text-[10px] bg-white px-1 border border-gray-300 rounded flex items-center gap-1 w-fit">
+                                            Coach: {currentCoach.name}
+                                        </span>
+                                    )}
+                                  </div>
+                               </div>
+                               <div className="text-xs font-mono text-gray-500">
+                                  {format(log.date, 'yyyy/MM/dd HH:mm')}
+                               </div>
+                            </div>
+                            
+                            {/* Content */}
+                            <div className="p-4">
+                               <div className="space-y-1 mb-4">
+                                  {log.items.map((item, idx) => (
+                                    <div key={item.id} className="flex justify-between items-center text-xs p-1 border-b border-gray-200 last:border-0">
+                                       <div className="flex items-center gap-2">
+                                          <span className="font-bold">{item.exercise}</span>
+                                          <span className="text-[10px] bg-gray-200 px-1 rounded text-gray-500">{item.muscle}</span>
+                                       </div>
+                                       <div className="font-mono font-bold text-gray-500">
+                                          {item.weight}kg x {item.sets} x {item.reps}
+                                       </div>
+                                    </div>
+                                  ))}
+                               </div>
+                               
+                               {log.notes && (
+                                 <div className="bg-white border border-gray-200 p-2 mb-4 text-xs text-gray-500 italic">
+                                    "{log.notes}"
+                                 </div>
+                               )}
+
+                               {/* Read Only Feedback Display */}
+                               <div className={`border-t border-dashed pt-3 mt-2 ${isGraded ? 'bg-[#e6fffa] -mx-4 px-4 pb-2 border-[#4ecdc4]' : 'border-gray-300'}`}>
+                                  <div className="flex justify-between items-start">
+                                      <div className="flex flex-col gap-1">
+                                          <div className="text-[10px] font-bold text-gray-400 uppercase tracking-wider">
+                                            {isGraded ? 'GRADED' : 'PENDING'}
+                                          </div>
+                                          {isGraded ? (
+                                              <div className="text-xs">
+                                                  <span className="font-bold text-[#2c7a7b]">Score: {log.score}</span>
+                                                  {log.coachComment && (
+                                                      <p className="text-gray-600 mt-1">"{log.coachComment}"</p>
+                                                  )}
+                                                  <div className="text-[10px] text-gray-400 mt-1 flex justify-between">
+                                                      <span>by Coach {commentingCoach?.name || 'Unknown'}</span>
+                                                      {log.coachCommentDate && (
+                                                         <span>{format(new Date(log.coachCommentDate), 'MM/dd HH:mm')}</span>
+                                                      )}
+                                                  </div>
+                                              </div>
+                                          ) : (
+                                              <div className="text-xs text-gray-400 italic">
+                                                  Waiting for coach...
+                                              </div>
+                                          )}
+                                      </div>
+                                  </div>
+                               </div>
+                            </div>
+                         </PixelCard>
+                      </div>
+                    )})
+                  )}
              </div>
-          </div>
+           </div>
         )}
 
       </main>
