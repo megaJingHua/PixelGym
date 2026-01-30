@@ -7,7 +7,6 @@ import * as kv from "./kv_store.tsx";
 const app = new Hono();
 const BASE_PATH = "/make-server-7819cca2";
 
-app.use('*', logger(console.log));
 app.use(
   "/*",
   cors({
@@ -18,6 +17,12 @@ app.use(
     maxAge: 600,
   }),
 );
+
+app.use('*', logger(console.log));
+
+app.options('*', (c) => {
+  return c.text('', 204);
+});
 
 app.get(`${BASE_PATH}/health`, (c) => {
   return c.json({ status: "ok" });
@@ -178,8 +183,13 @@ app.delete(`${BASE_PATH}/logs/:id`, async (c) => {
 
 // --- EXERCISES ---
 app.get(`${BASE_PATH}/exercises`, async (c) => {
-  const exercises = await kv.getByPrefix("exercise:");
-  return c.json(exercises);
+  try {
+    const exercises = await kv.getByPrefix("exercise:");
+    return c.json(exercises);
+  } catch (err: any) {
+    console.error("KV Error fetching exercises:", err);
+    return c.json({ error: "Failed to fetch exercises", details: err.message }, 500);
+  }
 });
 
 app.post(`${BASE_PATH}/exercises`, async (c) => {
@@ -187,6 +197,12 @@ app.post(`${BASE_PATH}/exercises`, async (c) => {
   const id = body.id || Date.now().toString();
   await kv.set(`exercise:${id}`, { ...body, id });
   return c.json({ success: true, exercise: { ...body, id } });
+});
+
+app.delete(`${BASE_PATH}/exercises/:id`, async (c) => {
+  const id = c.req.param("id");
+  await kv.del(`exercise:${id}`);
+  return c.json({ success: true });
 });
 
 // --- BATTLES ---
@@ -200,6 +216,12 @@ app.post(`${BASE_PATH}/battles`, async (c) => {
   const id = body.id || Date.now().toString();
   await kv.set(`battle:${id}`, { ...body, id });
   return c.json({ success: true, battle: { ...body, id } });
+});
+
+app.delete(`${BASE_PATH}/battles/:id`, async (c) => {
+  const id = c.req.param("id");
+  await kv.del(`battle:${id}`);
+  return c.json({ success: true });
 });
 
 app.post(`${BASE_PATH}/battles/:id/like`, async (c) => {
@@ -257,6 +279,89 @@ app.post(`${BASE_PATH}/battles/:id/comments`, async (c) => {
     return c.json({ success: true, battle });
   }
   return c.json({ error: "Battle not found" }, 404);
+});
+
+app.post(`${BASE_PATH}/battles/:id/records`, async (c) => {
+  const id = c.req.param("id");
+  const { studentId, studentName, content } = await c.req.json();
+  const battle = await kv.get(`battle:${id}`);
+  
+  if (battle) {
+    const newRecord = {
+      id: Date.now().toString(),
+      studentId,
+      studentName,
+      content,
+      completedAt: new Date().toISOString()
+    };
+    
+    const records = battle.records || [];
+    const existingIndex = records.findIndex((r: any) => r.studentId === studentId);
+    
+    if (existingIndex >= 0) {
+       records[existingIndex] = newRecord;
+    } else {
+       records.push(newRecord);
+    }
+
+    battle.records = records;
+    await kv.set(`battle:${id}`, battle);
+    return c.json({ success: true, battle });
+  }
+  return c.json({ error: "Battle not found" }, 404);
+});
+
+// --- UPLOAD ---
+app.post(`${BASE_PATH}/upload`, async (c) => {
+  const body = await c.req.parseBody();
+  const file = body['file'];
+
+  if (!file || !(file instanceof File)) {
+    return c.json({ error: "No file uploaded" }, 400);
+  }
+
+  const supabase = createClient(
+    Deno.env.get("SUPABASE_URL")!,
+    Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
+  );
+
+  const bucketName = "make-7819cca2-exercises";
+
+  // Ensure bucket exists
+  const { data: buckets } = await supabase.storage.listBuckets();
+  const bucketExists = buckets?.some(bucket => bucket.name === bucketName);
+  if (!bucketExists) {
+    await supabase.storage.createBucket(bucketName);
+  }
+
+  // Upload file
+  const fileExt = file.name.split('.').pop();
+  const fileName = `${Date.now()}-${Math.random().toString(36).substring(7)}.${fileExt}`;
+  const filePath = `${fileName}`;
+
+  const { error: uploadError } = await supabase.storage
+    .from(bucketName)
+    .upload(filePath, file, {
+      contentType: file.type,
+      upsert: false
+    });
+
+  if (uploadError) {
+    console.error("Upload error:", uploadError);
+    return c.json({ error: "Failed to upload file" }, 500);
+  }
+
+  // Create Signed URL (valid for 10 years approx)
+  const { data: signedUrlData, error: signedUrlError } = await supabase.storage
+    .from(bucketName)
+    .createSignedUrl(filePath, 315360000); // 10 years in seconds
+
+  if (signedUrlError || !signedUrlData?.signedUrl) {
+    console.error("Signed URL error:", signedUrlError);
+    return c.json({ error: "Failed to generate URL" }, 500);
+  }
+
+  return c.json({ url: signedUrlData.signedUrl });
 });
 
 Deno.serve(app.fetch);
