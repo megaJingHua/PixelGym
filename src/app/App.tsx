@@ -44,6 +44,7 @@ interface LogItem {
   reps: number;
   sets: number;
   muscle: string;
+  seconds?: number;
 }
 
 interface Log {
@@ -95,7 +96,7 @@ interface Battle {
   records?: BattleRecord[];
 }
 
-type AchievementType = 'log_count' | 'max_weight' | 'plan_count' | 'total_time';
+type AchievementType = 'log_count' | 'max_weight' | 'plan_count' | 'total_time' | 'specific_plan';
 
 interface Achievement {
   id: string;
@@ -107,6 +108,7 @@ interface Achievement {
   criteriaType: AchievementType;
   criteriaValue: number;
   criteriaExercise?: string; // Required if criteriaType is 'max_weight'
+  criteriaPlan?: LogItem[]; // Required if criteriaType is 'specific_plan'
 }
 
 interface BattleRecord {
@@ -367,25 +369,48 @@ export default function App() {
   ]);
 
   const getAchievementProgress = (ach: Achievement, logs: Log[]) => {
+    // Handle both Interface and System Object properties
+    const type = ach.criteriaType || (ach as any).type;
+    const threshold = ach.criteriaValue ?? (ach as any).threshold;
+    
     let current = 0;
-    if (ach.type === 'log_count') {
+    
+    if (type === 'log_count') {
         current = logs.length;
-    } else if (ach.type === 'max_weight') {
+    } else if (type === 'max_weight') {
         current = logs.reduce((max, log) => {
            const logMax = log.items.reduce((m, i) => Math.max(m, i.weight), 0);
            return Math.max(max, logMax);
         }, 0);
-    } else if (ach.type === 'plan_count') {
+    } else if (type === 'plan_count') {
         current = logs.filter(l => l.isPlanCompleted).length;
-    } else if (ach.type === 'total_time') {
+    } else if (type === 'total_time') {
         current = logs.reduce((total, log) => total + (log.duration || 0), 0);
+    } else if (type === 'specific_plan' && ach.criteriaPlan) {
+        // Check if any log matches the plan
+        const matchingLogs = logs.filter(log => {
+            // Check if log contains all criteria items
+            return ach.criteriaPlan!.every(cItem => {
+                return log.items.some(lItem => {
+                    const sameEx = lItem.exercise.toLowerCase() === cItem.exercise.toLowerCase();
+                    const weightOk = lItem.weight >= cItem.weight;
+                    const setsOk = lItem.sets >= cItem.sets;
+                    const repsOk = lItem.reps >= cItem.reps;
+                    const secondsOk = (lItem.seconds || 0) >= (cItem.seconds || 0);
+                    return sameEx && weightOk && setsOk && repsOk && secondsOk;
+                });
+            });
+        });
+        current = matchingLogs.length;
     }
 
     return {
         current,
-        threshold: ach.threshold,
-        progressText: `${current}/${ach.threshold} ${ach.type === 'total_time' ? 'mins' : ''}`,
-        isUnlocked: current >= ach.threshold
+        threshold,
+        progressText: type === 'specific_plan' 
+            ? (current >= (threshold || 1) ? 'Completed' : 'Not Completed')
+            : `${current}/${threshold} ${type === 'total_time' ? 'mins' : ''}`,
+        isUnlocked: current >= (threshold || 1)
     };
   };
 
@@ -459,7 +484,7 @@ export default function App() {
   const [loginError, setLoginError] = useState('');
 
   // Form State
-  const [newItem, setNewItem] = useState({ exercise: '', weight: '', reps: '10', sets: '3', muscle: '' });
+  const [newItem, setNewItem] = useState({ exercise: '', weight: '', reps: '10', sets: '3', muscle: '', seconds: '' });
   const [sessionNotes, setSessionNotes] = useState('');
   const [sessionDuration, setSessionDuration] = useState<number | ''>('');
   const [currentSessionItems, setCurrentSessionItems] = useState<LogItem[]>([]);
@@ -2207,7 +2232,8 @@ export default function App() {
                                        <span className="text-xs bg-gray-100 px-1 rounded text-gray-500">{item.muscle}</span>
                                     </div>
                                     <div className="font-mono text-gray-600">
-                                       {item.weight}kg x {item.reps}
+                                       {item.sets}x {item.weight}kg x {item.reps}
+                                       {item.seconds ? <span className="ml-1 text-blue-600">({item.seconds}s)</span> : ''}
                                     </div>
                                  </div>
                               ))}
@@ -2458,8 +2484,8 @@ export default function App() {
                       onChange={e => setNewItem({...newItem, weight: e.target.value})}
                     />
 
-                    {/* Sets & Reps */}
-                    <div className="grid grid-cols-2 gap-4">
+                    {/* Sets & Reps & Seconds */}
+                    <div className="grid grid-cols-3 gap-2">
                       <PixelInput 
                         label="組數" 
                         type="number" 
@@ -2479,6 +2505,13 @@ export default function App() {
                         onFocus={() => {
                            if (newItem.reps === '10') setNewItem(prev => ({ ...prev, reps: '' }));
                         }}
+                      />
+                      <PixelInput 
+                        label="秒數" 
+                        type="number" 
+                        placeholder="0" 
+                        value={newItem.seconds}
+                        onChange={e => setNewItem({...newItem, seconds: e.target.value})}
                       />
                     </div>
                     
@@ -3392,7 +3425,7 @@ export default function App() {
                    {/* System Achievements Management */}
                    <div>
                       <h2 className="text-2xl font-bold mb-4 flex items-center gap-2 border-b-4 border-black pb-2 text-[#ff6b6b]">
-                        <Trophy className="w-6 h-6" /> 系統成就
+                        <Trophy className="w-6 h-6" /> 系統成就 (System Achievements)
                       </h2>
                       <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                          {systemAchievements.map(ach => (
@@ -3405,22 +3438,9 @@ export default function App() {
                                   <p className="text-sm text-gray-600">{ach.description}</p>
                                   <p className="text-xs text-gray-400 mt-1 font-mono">Condition: {ach.type} {'>='} {ach.threshold}</p>
                                </div>
-                               {currentUser.name === 'iisa' && (
-                                  <PixelButton size="sm" variant="outline" onClick={() => {
-                                     const newThreshold = prompt(`Update threshold for ${ach.name}`, ach.threshold.toString());
-                                     if (newThreshold) {
-                                        setSystemAchievements(prev => prev.map(p => p.id === ach.id ? { ...p, threshold: Number(newThreshold) } : p));
-                                     }
-                                  }}>
-                                     <Edit className="w-4 h-4" />
-                                  </PixelButton>
-                               )}
                             </div>
                          ))}
                       </div>
-                      {currentUser.name === 'iisa' && (
-                         <p className="text-xs text-gray-500 mt-2">* Admin can edit thresholds by clicking the edit icon.</p>
-                      )}
                    </div>
 
                    {/* Custom Tasks / Badges Management */}
