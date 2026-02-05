@@ -7,8 +7,9 @@ import * as kv from "./kv_store.tsx";
 const app = new Hono();
 const BASE_PATH = "/make-server-7819cca2";
 
+// Enable CORS for all routes
 app.use(
-  "/*",
+  "*",
   cors({
     origin: "*",
     allowHeaders: ["Content-Type", "Authorization", "apikey", "x-client-info"],
@@ -20,14 +21,12 @@ app.use(
 
 app.use('*', logger(console.log));
 
-app.options('*', (c) => {
-  return c.text('', 204);
-});
-
+// Health check
 app.get(`${BASE_PATH}/health`, (c) => {
   return c.json({ status: "ok" });
 });
 
+// Error handling
 app.onError((err, c) => {
   console.error(`Server Error [${c.req.method} ${c.req.url}]:`, err);
   return c.json({ error: err.message || "Internal Server Error" }, 500);
@@ -139,7 +138,6 @@ app.delete(`${BASE_PATH}/users/:id`, async (c) => {
   
   if (error) {
     console.error(`Failed to delete user ${id} from Auth:`, error);
-    // Continue to delete from KV even if Auth delete fails (or maybe user is already gone from Auth)
   } else {
     console.log(`User ${id} deleted from Auth`);
   }
@@ -197,6 +195,16 @@ app.post(`${BASE_PATH}/exercises`, async (c) => {
   const id = body.id || Date.now().toString();
   await kv.set(`exercise:${id}`, { ...body, id });
   return c.json({ success: true, exercise: { ...body, id } });
+});
+
+app.put(`${BASE_PATH}/exercises/:id`, async (c) => {
+  const id = c.req.param("id");
+  const body = await c.req.json();
+  const existing = await kv.get(`exercise:${id}`);
+  if (!existing) return c.json({ error: "Exercise not found" }, 404);
+  const updated = { ...existing, ...body };
+  await kv.set(`exercise:${id}`, updated);
+  return c.json({ success: true, exercise: updated });
 });
 
 app.delete(`${BASE_PATH}/exercises/:id`, async (c) => {

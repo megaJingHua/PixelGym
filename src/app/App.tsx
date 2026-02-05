@@ -3,9 +3,11 @@ import { PixelCard } from '@/app/components/PixelCard';
 import { PixelButton } from '@/app/components/PixelButton';
 import { PixelInput } from '@/app/components/PixelInput';
 import { PixelBadge } from '@/app/components/PixelBadge';
-import { Dumbbell, Trophy, BookOpen, User, Plus, Sword, LogOut, Flame, Share2, Camera, Eye, EyeOff, Trash2, MessageSquare, Star, Settings, X, CheckCircle, ChevronDown, ChevronUp, Calendar } from 'lucide-react';
+import { PixelToast, ToastType } from '@/app/components/PixelToast';
+import { Dumbbell, Trophy, BookOpen, User, Plus, Sword, LogOut, Flame, Share2, Camera, Eye, EyeOff, Trash2, MessageSquare, Star, Settings, X, CheckCircle, ChevronDown, ChevronUp, Calendar, Search, Edit, Target } from 'lucide-react';
 import { format } from 'date-fns';
 import { ImageWithFallback } from '@/app/components/figma/ImageWithFallback';
+import { ExerciseImage } from '@/app/components/ExerciseImage';
 import { createClient } from '@supabase/supabase-js';
 import { projectId, publicAnonKey } from '/utils/supabase/info';
 
@@ -31,6 +33,8 @@ interface UserAccount {
   status: UserStatus;
   coachId?: string; // Only for students
   customBadges?: { icon: string, name: string, color: string }[];
+  selectedBadgeIds?: string[];
+  definedAchievements?: Achievement[]; // Coach created achievements
 }
 
 interface LogItem {
@@ -53,6 +57,11 @@ interface Log {
   coachIdWhoCommented?: string;
   coachCommentDate?: Date;
   isHidden?: boolean;
+  isPlan?: boolean;
+  isPlanCompleted?: boolean;
+  duration?: number; // Minutes
+  isShared?: boolean;
+  sharedFrom?: string; // ID of the student who shared this log
 }
 
 interface Exercise {
@@ -62,6 +71,8 @@ interface Exercise {
   guide: string;
   imageUrl: string;
   author: string;
+  level?: number; // 1-5
+  tools?: string;
 }
 
 interface BattleComment {
@@ -82,6 +93,20 @@ interface Battle {
   createdAt?: Date;
   targetStudentId?: string; // 'all' or specific student ID
   records?: BattleRecord[];
+}
+
+type AchievementType = 'log_count' | 'max_weight' | 'plan_count' | 'total_time';
+
+interface Achievement {
+  id: string;
+  creatorId: string; // 'admin' or coach ID
+  targetAudience: 'all' | 'students'; // 'all' only for admin
+  title: string;
+  description: string;
+  icon: string;
+  criteriaType: AchievementType;
+  criteriaValue: number;
+  criteriaExercise?: string; // Required if criteriaType is 'max_weight'
 }
 
 interface BattleRecord {
@@ -218,6 +243,18 @@ const api = {
     });
     return res.json();
   },
+  updateExercise: async (id: string, updates: Partial<Exercise>) => {
+    const res = await fetch(`${API_URL}/exercises/${id}`, {
+      method: 'PUT',
+      headers: { 
+        'Content-Type': 'application/json', 
+        Authorization: `Bearer ${publicAnonKey}`,
+        apikey: publicAnonKey
+      },
+      body: JSON.stringify(updates)
+    });
+    return res.json();
+  },
   deleteExercise: async (id: string) => {
     await fetch(`${API_URL}/exercises/${id}`, { 
       method: 'DELETE', 
@@ -311,10 +348,78 @@ const api = {
   }
 };
 
+const DEFAULT_SYSTEM_ACHIEVEMENTS = [
+  { id: 'newbie', name: '新手上路', icon: '🏅', color: 'bg-green-100 text-green-700', description: '完成 1 次訓練', type: 'log_count', threshold: 1 },
+  { id: 'persistent', name: '持之以恆', icon: '🥉', color: 'bg-orange-100 text-orange-700', description: '完成 10 次訓練', type: 'log_count', threshold: 10 },
+  { id: 'athlete', name: '健身運動員', icon: '🥈', color: 'bg-gray-100 text-gray-700', description: '完成 30 次訓練', type: 'log_count', threshold: 30 },
+  { id: 'elite', name: '健身菁英', icon: '🥇', color: 'bg-yellow-100 text-yellow-700', description: '完成 50 次訓練', type: 'log_count', threshold: 50 },
+  { id: 'heavy_lifter', name: '大力士', icon: '💪', color: 'bg-red-100 text-red-700', description: '單次舉重超過 100kg', type: 'max_weight', threshold: 100 },
+];
+
 export default function App() {
   // Global State
   const [users, setUsers] = useState<UserAccount[]>([]);
   const [currentUser, setCurrentUser] = useState<UserAccount | null>(null);
+  const [systemAchievements, setSystemAchievements] = useState(DEFAULT_SYSTEM_ACHIEVEMENTS);
+  const [coachCustomTemplates, setCoachCustomTemplates] = useState<{ id: string, name: string, icon: string, description: string }[]>([
+     { id: 'custom_1', name: '全勤寶寶', icon: '🌞', description: '連續一週出席' },
+     { id: 'custom_2', name: '核心殺手', icon: '🔥', description: '完成核心訓練挑戰' }
+  ]);
+
+  const getAchievementProgress = (ach: Achievement, logs: Log[]) => {
+    let current = 0;
+    if (ach.type === 'log_count') {
+        current = logs.length;
+    } else if (ach.type === 'max_weight') {
+        current = logs.reduce((max, log) => {
+           const logMax = log.items.reduce((m, i) => Math.max(m, i.weight), 0);
+           return Math.max(max, logMax);
+        }, 0);
+    } else if (ach.type === 'plan_count') {
+        current = logs.filter(l => l.isPlanCompleted).length;
+    } else if (ach.type === 'total_time') {
+        current = logs.reduce((total, log) => total + (log.duration || 0), 0);
+    }
+
+    return {
+        current,
+        threshold: ach.threshold,
+        progressText: `${current}/${ach.threshold} ${ach.type === 'total_time' ? 'mins' : ''}`,
+        isUnlocked: current >= ach.threshold
+    };
+  };
+
+  const handleToggleBadgeSelection = async (badgeId: string) => {
+      if (!currentUser) return;
+      
+      const currentSelection = currentUser.selectedBadgeIds || [];
+      let newSelection = [];
+      
+      if (currentSelection.includes(badgeId)) {
+          newSelection = currentSelection.filter(id => id !== badgeId);
+      } else {
+          if (currentSelection.length >= 3) {
+              alert("最多只能選擇 3 個徽章展示 (Max 3 badges)");
+              return;
+          }
+          newSelection = [...currentSelection, badgeId];
+      }
+      
+      const updatedUser = { ...currentUser, selectedBadgeIds: newSelection };
+      setCurrentUser(updatedUser);
+      setUsers(users.map(u => u.id === currentUser.id ? updatedUser : u));
+      
+      try {
+          await api.createUser(updatedUser);
+      } catch (err) {
+          console.error("Failed to update badge selection", err);
+      }
+  };
+
+  const checkAchievement = (ach: Achievement, logs: Log[]) => {
+    return getAchievementProgress(ach, logs).isUnlocked;
+  };
+
   const [isLoading, setIsLoading] = useState(true);
 
   // UI State
@@ -326,6 +431,15 @@ export default function App() {
   const [expandedLogs, setExpandedLogs] = useState<string[]>([]);
   const [viewingStudentId, setViewingStudentId] = useState<string | null>(null);
   const hasInitializedLogState = React.useRef(false);
+
+  // Achievement State
+  const [achievements, setAchievements] = useState<Achievement[]>([
+    ...DEFAULT_SYSTEM_ACHIEVEMENTS.map(a => ({ ...a, creatorId: 'admin', criteriaType: a.type as AchievementType, criteriaValue: a.threshold, targetAudience: 'all' as const }))
+  ]);
+  const [isAchievementModalOpen, setIsAchievementModalOpen] = useState(false);
+  const [newAchievement, setNewAchievement] = useState<Partial<Achievement>>({
+    title: '', description: '', icon: '🏆', criteriaType: 'log_count', criteriaValue: 5, targetAudience: 'students'
+  });
 
   const toggleLogExpansion = (id: string) => {
      setExpandedLogs(prev => 
@@ -345,12 +459,15 @@ export default function App() {
   const [loginError, setLoginError] = useState('');
 
   // Form State
-  const [newItem, setNewItem] = useState({ exercise: '', weight: '', reps: '', sets: '', muscle: '' });
+  const [newItem, setNewItem] = useState({ exercise: '', weight: '', reps: '10', sets: '3', muscle: '' });
   const [sessionNotes, setSessionNotes] = useState('');
+  const [sessionDuration, setSessionDuration] = useState<number | ''>('');
   const [currentSessionItems, setCurrentSessionItems] = useState<LogItem[]>([]);
   
-  const [newExercise, setNewExercise] = useState({ name: '', muscle: '', guide: '', imageUrl: '' });
+  const [newExercise, setNewExercise] = useState({ name: '', muscle: '', guide: '', imageUrl: '', level: 1, tools: '' });
+  const [editingExerciseId, setEditingExerciseId] = useState<string | null>(null);
   const [exerciseImageFile, setExerciseImageFile] = useState<File | null>(null);
+  const [wikiSearchTerm, setWikiSearchTerm] = useState('');
   
   // Battle Form State
   const [isCreatingBattle, setIsCreatingBattle] = useState(false);
@@ -363,6 +480,29 @@ export default function App() {
   const [battleFilter, setBattleFilter] = useState<'all' | 'received' | 'sent'>('all');
   const [isCoachZoneOpen, setIsCoachZoneOpen] = useState(false);
   const [adminSelectedStudentId, setAdminSelectedStudentId] = useState<string | null>(null);
+  
+  // Assign Plan State
+  const [isAssignModalOpen, setIsAssignModalOpen] = useState(false);
+  const [assignSelectedStudents, setAssignSelectedStudents] = useState<string[]>([]);
+  const [activeLogId, setActiveLogId] = useState<string | null>(null);
+  const [planExecutionDate, setPlanExecutionDate] = useState<string>(format(new Date(), 'yyyy-MM-dd'));
+  const [studentLogDate, setStudentLogDate] = useState<string>(format(new Date(), 'yyyy-MM-dd'));
+
+  // Toast State
+  const [toast, setToast] = useState<{ message: string; type: ToastType; isVisible: boolean }>({
+    message: '',
+    type: 'info',
+    isVisible: false
+  });
+  const [isSubmitting, setIsSubmitting] = useState(false);
+
+  const showToast = (message: string, type: ToastType = 'info') => {
+    setToast({ message, type, isVisible: true });
+  };
+
+  const hideToast = () => {
+    setToast(prev => ({ ...prev, isVisible: false }));
+  };
 
   // Initial Data Fetch
   const fetchInitialData = async () => {
@@ -431,7 +571,7 @@ export default function App() {
     try {
       const res = await api.updateAccount(settingsForm);
       if (res.error) throw new Error(res.error);
-      alert("帳號資料已更新！(Account Updated)");
+      alert("帳號資料已更新！");
       setIsSettingsOpen(false);
       setSettingsForm({ email: '', password: '' });
     } catch (err: any) {
@@ -462,7 +602,7 @@ export default function App() {
 
         if (res.error) {
             if (res.error.includes("already been registered")) {
-                throw new Error("此 Email 已被註冊，請直接登入 (Email already registered)");
+                throw new Error("此 Email 已被註冊，請直接登入");
             }
             throw new Error(res.error);
         }
@@ -586,75 +726,269 @@ export default function App() {
       muscle: newItem.muscle || '全身',
     };
     setCurrentSessionItems([...currentSessionItems, item]);
-    setNewItem({ exercise: '', weight: '', reps: '', sets: '', muscle: '' });
+    setNewItem({ exercise: '', weight: '', reps: '10', sets: '3', muscle: '' });
   };
 
   const handleRemoveItem = (id: string) => {
     setCurrentSessionItems(currentSessionItems.filter(i => i.id !== id));
   };
 
+  const handleUpdateItem = (id: string, field: keyof LogItem, value: any) => {
+    setCurrentSessionItems(prev => prev.map(item => 
+      item.id === id ? { ...item, [field]: value } : item
+    ));
+  };
+
+  const toggleAssignStudent = (studentId: string) => {
+    setAssignSelectedStudents(prev => 
+        prev.includes(studentId) 
+        ? prev.filter(id => id !== studentId)
+        : [...prev, studentId]
+    );
+  };
+
+  const handleAssignPlan = async () => {
+    if (currentSessionItems.length === 0) {
+        alert("請至少新增一個項目！");
+        return;
+    }
+    if (assignSelectedStudents.length === 0) {
+        alert("請至少選擇一位學員！");
+        return;
+    }
+
+    const newLogs: Log[] = [];
+    
+    // Create a plan for each student
+    for (const studentId of assignSelectedStudents) {
+        const log: Log = {
+            id: Date.now().toString() + Math.random().toString(36).substr(2, 9),
+            studentId: studentId,
+            date: new Date(),
+            items: currentSessionItems,
+            notes: sessionNotes || 'Coach Assigned Plan',
+            isHidden: false,
+            isPlan: true
+        };
+        
+        await api.createLog(log);
+        newLogs.push(log);
+    }
+    
+    setLogs([...newLogs, ...logs]);
+    
+    // Reset
+    setCurrentSessionItems([]);
+    setSessionNotes('');
+    setAssignSelectedStudents([]);
+    setIsAssignModalOpen(false);
+    alert("課表已派發！");
+  };
+
   const handleSubmitSession = async (e: React.FormEvent) => {
     e.preventDefault();
     if (currentSessionItems.length === 0) {
-      alert("請至少新增一個項目！");
+      showToast("請至少新增一個項目！", 'error');
       return;
     }
     
-    const log: Log = {
-      id: Date.now().toString(),
-      studentId: currentUser?.id || '',
-      date: new Date(),
-      items: currentSessionItems,
-      notes: sessionNotes,
-      isHidden: false
-    };
-    
-    await api.createLog(log);
-    setLogs([log, ...logs]);
-    setExpandedLogs([log.id]); // Auto expand the new log
+    if (activeLogId) {
+        // Update existing plan to become a real log
+        const updatedDate = new Date();
+        await api.updateLog(activeLogId, {
+            items: currentSessionItems,
+            notes: sessionNotes,
+            isPlan: false,
+            isPlanCompleted: true,
+            duration: Number(sessionDuration) || 0,
+            date: updatedDate
+        });
+        
+        setLogs(logs.map(l => l.id === activeLogId ? {
+            ...l, 
+            items: currentSessionItems, 
+            notes: sessionNotes, 
+            isPlan: false,
+            isPlanCompleted: true,
+            duration: Number(sessionDuration) || 0,
+            date: updatedDate
+        } : l));
+        
+        setActiveLogId(null);
+        showToast("日記已更新！", 'success');
+    } else {
+        const targetId = (currentUser?.role === 'coach' && viewingStudentId) ? viewingStudentId : (currentUser?.id || '');
+        const isCoach = currentUser?.role === 'coach';
+        
+        const log: Log = {
+          id: Date.now().toString(),
+          studentId: targetId,
+          date: isCoach ? new Date(planExecutionDate) : new Date(studentLogDate),
+          items: currentSessionItems,
+          notes: sessionNotes,
+          isHidden: false,
+          isPlan: isCoach,
+          duration: isCoach ? 0 : (Number(sessionDuration) || 0)
+        };
+        
+        await api.createLog(log);
+        setLogs([log, ...logs]);
+        setExpandedLogs([log.id]);
+        
+        if (isCoach) {
+           showToast("課表已指派！", 'success');
+        } else {
+           showToast("日記已儲存！", 'success');
+        }
+    }
     
     // Reset form
     setCurrentSessionItems([]);
     setSessionNotes('');
-    setIsLogModalOpen(false); // Close modal
+    setSessionDuration('');
+    setIsLogModalOpen(false);
+  };
+
+  const [isShareModalOpen, setIsShareModalOpen] = useState(false);
+  const [shareSelectedStudentIds, setShareSelectedStudentIds] = useState<string[]>([]);
+  const [logIdToShare, setLogIdToShare] = useState<string | null>(null);
+
+  const handleShareLog = async () => {
+     if (!logIdToShare || shareSelectedStudentIds.length === 0) {
+        showToast("請選擇要分享的對象", 'error');
+        return;
+     }
+
+     const sourceLog = logs.find(l => l.id === logIdToShare);
+     if (!sourceLog) return;
+
+     const newLogs: Log[] = [];
+     
+     for (const studentId of shareSelectedStudentIds) {
+        const studentName = users.find(u => u.id === studentId)?.name || 'Unknown';
+        
+        // Create a COPY of the log for the target student
+        // It will be created as a PLAN (isPlan: true) so they can choose to execute it
+        // but it is fully editable and deletable by them.
+        const log: Log = {
+            id: Date.now().toString() + Math.random().toString(36).substr(2, 9),
+            studentId: studentId,
+            date: new Date(), // Shared today
+            items: sourceLog.items.map(item => ({...item, id: Date.now().toString() + Math.random().toString(36).substr(2, 5)})), // New Item IDs
+            notes: `[Shared by ${currentUser?.name}] ${sourceLog.notes || ''}`,
+            isHidden: false,
+            isPlan: true, // It appears as a "Plan" or "Challenge" in their feed
+            duration: 0,
+            sharedFrom: currentUser?.id
+        };
+        
+        await api.createLog(log);
+        newLogs.push(log);
+     }
+     
+     // Update local state if I am sharing to myself (unlikely but possible) or if I can see their logs
+     // Actually, just append to logs to be safe, filtering will handle visibility
+     setLogs([...newLogs, ...logs]);
+     
+     setIsShareModalOpen(false);
+     setShareSelectedStudentIds([]);
+     setLogIdToShare(null);
+     showToast(`已分享給 ${shareSelectedStudentIds.length} 位學員！`, 'success');
+  };
+
+  const handleStartEditExercise = (ex: Exercise) => {
+      setNewExercise({
+          name: ex.name,
+          muscle: ex.muscle,
+          guide: ex.guide,
+          imageUrl: ex.imageUrl,
+          level: ex.level || 1,
+          tools: ex.tools || ''
+      });
+      setEditingExerciseId(ex.id);
+      setIsCoachZoneOpen(true);
   };
 
   const handleUploadExercise = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!newExercise.name || !newExercise.muscle) {
-      alert("請填寫完整資訊");
+      showToast("請填寫完整資訊", 'error');
       return;
     }
 
-    let uploadedImageUrl = 'https://images.unsplash.com/photo-1608067008273-aaff95eca6ce?crop=entropy&cs=tinysrgb&fit=max&fm=jpg&ixid=M3w3Nzg4Nzd8MHwxfHNlYXJjaHwxfHxwaXhlbCUyMGFydCUyMGd5bSUyMGVxdWlwbWVudHxlbnwxfHx8fDE3Njk2NTA1MDl8MA&ixlib=rb-4.1.0&q=80&w=1080&utm_source=figma&utm_medium=referral';
+    // Check for duplicate names
+    const isDuplicate = exercises.some(ex => 
+        ex.name.trim() === newExercise.name.trim() && 
+        ex.id !== editingExerciseId
+    );
 
-    if (exerciseImageFile) {
-        try {
-            const uploadRes = await api.uploadFile(exerciseImageFile);
-            if (uploadRes.url) {
-                uploadedImageUrl = uploadRes.url;
-            }
-        } catch (err) {
-            console.error("Upload error:", err);
-            alert("圖片上傳失敗，將使用預設圖片");
-        }
+    if (isDuplicate) {
+        showToast("動作名稱已存在，請勿重複建立", 'error');
+        return;
     }
 
-    const exercise: Exercise = {
-      id: Date.now().toString(),
-      name: newExercise.name,
-      muscle: newExercise.muscle,
-      guide: newExercise.guide || '無介紹',
-      imageUrl: uploadedImageUrl,
-      author: currentUser?.name || 'Unknown'
-    };
+    setIsSubmitting(true);
+    // Keep info toast visible until success or error
+    // We don't use auto-hide for loading state usually, but here I'll just show it.
+    // The success/error toast will override it.
+    showToast("正在處理中... ", 'info');
 
-    await api.createExercise(exercise);
-    setExercises([exercise, ...exercises]);
-    alert("Wiki更新成功！");
-    setNewExercise({ name: '', muscle: '', guide: '', imageUrl: '' });
-    setExerciseImageFile(null);
-    setIsCoachZoneOpen(false);
+    try {
+        let uploadedImageUrl = editingExerciseId 
+            ? exercises.find(e => e.id === editingExerciseId)?.imageUrl || ''
+            : 'https://images.unsplash.com/photo-1608067008273-aaff95eca6ce?crop=entropy&cs=tinysrgb&fit=max&fm=jpg&ixid=M3w3Nzg4Nzd8MHwxfHNlYXJjaHwxfHxwaXhlbCUyMGFydCUyMGd5bSUyMGVxdWlwbWVudHxlbnwxfHx8fDE3Njk2NTA1MDl8MA&ixlib=rb-4.1.0&q=80&w=1080&utm_source=figma&utm_medium=referral';
+
+        if (exerciseImageFile) {
+            try {
+                const uploadRes = await api.uploadFile(exerciseImageFile);
+                if (uploadRes.url) {
+                    uploadedImageUrl = uploadRes.url;
+                }
+            } catch (err) {
+                console.error("Upload error:", err);
+                showToast("圖片上傳失敗，將使用預設圖片", 'error');
+            }
+        }
+
+        if (editingExerciseId) {
+            const updates = {
+                name: newExercise.name,
+                muscle: newExercise.muscle,
+                guide: newExercise.guide || '',
+                imageUrl: uploadedImageUrl,
+                level: newExercise.level || 1,
+                tools: newExercise.tools || '無器材'
+            };
+            await api.updateExercise(editingExerciseId, updates);
+            setExercises(exercises.map(ex => ex.id === editingExerciseId ? { ...ex, ...updates } : ex));
+            showToast("動作更新成功！", 'success');
+        } else {
+            const exercise: Exercise = {
+              id: Date.now().toString(),
+              name: newExercise.name,
+              muscle: newExercise.muscle,
+              guide: newExercise.guide || '',
+              imageUrl: uploadedImageUrl,
+              author: currentUser?.name || 'Unknown',
+              level: newExercise.level || 1,
+              tools: newExercise.tools || '無器材'
+            };
+        
+            await api.createExercise(exercise);
+            setExercises([exercise, ...exercises]);
+            showToast("更新成功！", 'success');
+        }
+
+        setNewExercise({ name: '', muscle: '', guide: '', imageUrl: '', level: 1, tools: '' });
+        setExerciseImageFile(null);
+        setEditingExerciseId(null);
+        setIsCoachZoneOpen(false);
+    } catch (error) {
+        console.error("Operation failed:", error);
+        showToast("操作失敗 (Failed)", 'error');
+    } finally {
+        setIsSubmitting(false);
+    }
   };
 
   const handleDeleteExercise = async (id: string) => {
@@ -674,25 +1008,37 @@ export default function App() {
   };
 
   const deleteLog = async (id: string) => {
-    if (window.confirm('確定要刪除這條記錄嗎？(Are you sure?)')) {
+    if (window.confirm('確定要刪除這條記錄嗎？')) {
       await api.deleteLog(id);
       setLogs(logs.filter(log => log.id !== id));
     }
   };
 
-  const updateLogFeedback = async (id: string, score: number | undefined, comment: string) => {
+  const handleDuplicateLog = (log: Log) => {
+    // Fill the Add Log form with this log's items and notes
+    setCurrentSessionItems(log.items.map(item => ({
+        ...item,
+        id: Date.now().toString() + Math.random().toString(36).substr(2, 5) // New IDs
+    })));
+    setSessionNotes(log.notes);
+    setIsLogModalOpen(true);
+    showToast("日記內容已複製到新增畫面", 'success');
+  };
+
+
+
+  const updateLogFeedback = async (id: string, comment: string) => {
     const now = new Date();
-    await api.updateLog(id, { score, coachComment: comment, coachIdWhoCommented: currentUser?.id, coachCommentDate: now });
+    await api.updateLog(id, { coachComment: comment, coachIdWhoCommented: currentUser?.id, coachCommentDate: now });
     setLogs(logs.map(log => 
       log.id === id ? { 
         ...log, 
-        score, 
         coachComment: comment,
         coachIdWhoCommented: currentUser?.id,
         coachCommentDate: now
       } : log
     ));
-    alert('評分與備註已更新！');
+    showToast('教練留言已更新！', 'success');
   };
 
   // Battle Handlers
@@ -736,7 +1082,7 @@ export default function App() {
   };
 
   const handleDeleteBattle = async (id: string) => {
-    if (!window.confirm('確定要刪除此挑戰嗎？ (Are you sure?)')) return;
+    if (!window.confirm('確定要刪除此挑戰嗎？')) return;
     await api.deleteBattle(id);
     setBattles(battles.filter(b => b.id !== id));
   };
@@ -770,7 +1116,18 @@ export default function App() {
     let filteredLogs = [];
 
     if (currentUser.role === 'student') {
-      filteredLogs = logs.filter(log => log.studentId === currentUser.id);
+      // Show own logs AND shared logs from students with same coach
+      filteredLogs = logs.filter(log => {
+          if (log.studentId === currentUser.id) return true;
+          if (log.isShared) {
+              const logOwner = users.find(u => u.id === log.studentId);
+              // Check if logOwner exists and shares the same coach
+              if (logOwner && logOwner.coachId && logOwner.coachId === currentUser.coachId) {
+                  return true;
+              }
+          }
+          return false;
+      });
     } else {
       // Coach (including Super Admin iisa acting as Coach)
       // Only see logs from students assigned to this coach
@@ -807,19 +1164,34 @@ export default function App() {
   const getVisibleExercises = () => {
     if (!currentUser) return [];
     
+    let filteredExercises = [];
+
     // If student, filter by their coach's name
     if (currentUser.role === 'student') {
-       if (!currentUser.coachId) return [];
-       const myCoach = users.find(u => u.id === currentUser.coachId);
-       return myCoach ? exercises.filter(ex => ex.author === myCoach.name) : [];
+       if (!currentUser.coachId) {
+          filteredExercises = [];
+       } else {
+          const myCoach = users.find(u => u.id === currentUser.coachId);
+          filteredExercises = myCoach ? exercises.filter(ex => ex.author === myCoach.name) : [];
+       }
+    } else if (currentUser.role === 'coach') {
+       // If coach, filter by their own name
+       filteredExercises = exercises.filter(ex => ex.author === currentUser.name);
+    } else {
+       filteredExercises = exercises;
+    }
+
+    // Apply Search Filter
+    if (wikiSearchTerm.trim()) {
+      const lowerTerm = wikiSearchTerm.toLowerCase();
+      filteredExercises = filteredExercises.filter(ex => 
+        ex.name.toLowerCase().includes(lowerTerm) || 
+        ex.muscle.toLowerCase().includes(lowerTerm) ||
+        ex.guide.toLowerCase().includes(lowerTerm)
+      );
     }
     
-    // If coach, filter by their own name
-    if (currentUser.role === 'coach') {
-       return exercises.filter(ex => ex.author === currentUser.name);
-    }
-    
-    return exercises;
+    return filteredExercises;
   };
 
   // Helper to get all available exercise names (Wiki + User History)
@@ -829,7 +1201,8 @@ export default function App() {
     
     if (currentUser) {
       // Get all unique exercise names from user's logs
-      const myLogs = logs.filter(l => l.studentId === currentUser.id);
+      const targetId = (currentUser.role === 'coach' && viewingStudentId) ? viewingStudentId : currentUser.id;
+      const myLogs = logs.filter(l => l.studentId === targetId);
       myLogs.forEach(log => {
         log.items.forEach(item => {
            if (item.exercise) historyNames.push(item.exercise);
@@ -888,7 +1261,7 @@ export default function App() {
             />
 
             <PixelInput 
-              label="密碼 (Password)" 
+              label="密碼" 
               type="password"
               value={passwordInput}
               onChange={(e) => setPasswordInput(e.target.value)}
@@ -897,7 +1270,7 @@ export default function App() {
             
             {isRegistering && (
               <div className="space-y-2">
-                <label className="font-bold text-gray-900 uppercase text-sm">角色 (Role)</label>
+                <label className="font-bold text-gray-900 uppercase text-sm">角色</label>
                 <div className="flex gap-4">
                   <button
                     type="button"
@@ -961,7 +1334,7 @@ export default function App() {
                 <h1 className="text-xl font-bold text-[#ffcd38]">PIXEL GYM</h1>
             </div>
             <PixelButton variant="outline" size="sm" onClick={handleLogout} className="bg-gray-800 border-gray-600 text-white hover:bg-gray-700">
-              <LogOut className="w-4 h-4" /> 登出 (Logout)
+              <LogOut className="w-4 h-4" /> 登出
             </PixelButton>
           </div>
         </header>
@@ -1007,6 +1380,12 @@ export default function App() {
 
   return (
     <div className="min-h-screen bg-[#f0f0f0] flex flex-col font-[DotGothic16]">
+      <PixelToast 
+        message={toast.message} 
+        type={toast.type} 
+        isVisible={toast.isVisible} 
+        onClose={hideToast}
+      />
       {/* Header */}
       <header className="bg-gray-900 text-white p-4 border-b-4 border-black sticky top-0 z-50">
         <div className="max-w-4xl mx-auto flex justify-between items-center">
@@ -1018,7 +1397,7 @@ export default function App() {
               <h1 className="text-xl font-bold leading-none text-[#ffcd38]">PIXEL GYM</h1>
               <div className="flex items-center gap-2 text-xs text-gray-400 mt-1">
                 <span className="w-2 h-2 bg-green-500 rounded-full animate-pulse"></span>
-                {currentUser.name === 'iisa' ? 'Super Admin' : `Level ${currentUser.role === 'coach' ? '99' : '1'} ${currentUser.role === 'coach' ? 'Coach' : 'Student'}`}
+                {currentUser.name === 'iisa' ? 'Super Admin' : `${currentUser.name} (${currentUser.role === 'coach' ? 'Coach' : 'Student'})`}
               </div>
             </div>
           </div>
@@ -1058,7 +1437,7 @@ export default function App() {
               <X className="w-6 h-6" />
             </button>
             <h3 className="text-xl font-bold mb-6 flex items-center gap-2 border-b-4 border-black pb-2">
-              <Settings className="w-6 h-6" /> 帳號設定 (Settings)
+              <Settings className="w-6 h-6" /> 帳號設定
             </h3>
             <form onSubmit={handleUpdateAccount} className="space-y-4">
               <PixelInput 
@@ -1069,7 +1448,7 @@ export default function App() {
                 onChange={e => setSettingsForm({...settingsForm, email: e.target.value})}
               />
               <PixelInput 
-                label="更新密碼 (Password)" 
+                label="更新密碼" 
                 type="password"
                 placeholder="New Password..."
                 value={settingsForm.password}
@@ -1077,7 +1456,7 @@ export default function App() {
               />
               <div className="pt-2">
                 <PixelButton type="submit" className="w-full" variant="accent">
-                  確認更新 (UPDATE)
+                  確認更新
                 </PixelButton>
               </div>
             </form>
@@ -1116,7 +1495,7 @@ export default function App() {
                          </span>
                        </h2>
                        <div className="text-sm text-gray-500 font-mono mt-1">
-                         {studentLogs.length} Logs • Coach: {users.find(u => u.id === student.coachId)?.name || 'None'}
+                         {studentLogs.length} 紀錄 • Coach: {users.find(u => u.id === student.coachId)?.name || 'None'}
                        </div>
                      </div>
                      
@@ -1124,7 +1503,7 @@ export default function App() {
                         <PixelButton 
                           variant="outline"
                           onClick={() => {
-                             const headers = ['Date', 'Exercise', 'Weight(kg)', 'Sets', 'Reps', 'Muscle', 'Notes', 'Coach Comment', 'Score'];
+                             const headers = ['Date', 'Exercise', 'Weight(kg)', 'Sets', 'Reps', 'Tags', 'Notes', 'Coach Comment', 'Score'];
                              const csvRows = [headers.join(',')];
                              
                              studentLogs.forEach(log => {
@@ -1155,107 +1534,16 @@ export default function App() {
                              document.body.removeChild(link);
                           }}
                         >
-                          <Share2 className="w-4 h-4 mr-2" /> 匯出 CSV (Export)
+                          <Share2 className="w-4 h-4 mr-2" /> 匯出 CSV
                         </PixelButton>
                      </div>
-                  </div>
-
-                  {/* Achievements Section */}
-                  <div className="p-6 border-b-4 border-black bg-white">
-                     {(() => {
-                        // Calculate Automatic Badges
-                        const totalWorkouts = studentLogs.length;
-                        const autoBadges = [];
-                        if (totalWorkouts >= 1) autoBadges.push({ icon: '🏅', name: '新手上路', color: 'bg-green-100 text-green-700' });
-                        if (totalWorkouts >= 10) autoBadges.push({ icon: '🥉', name: '持之以恆', color: 'bg-orange-100 text-orange-700' });
-                        if (totalWorkouts >= 30) autoBadges.push({ icon: '🥈', name: '健身運動員', color: 'bg-gray-100 text-gray-700' });
-                        if (totalWorkouts >= 50) autoBadges.push({ icon: '🥇', name: '健身菁英', color: 'bg-yellow-100 text-yellow-700' });
-                        
-                        // Heavy Lifter Check
-                        const maxWeight = studentLogs.reduce((max, log) => {
-                           const logMax = log.items.reduce((m, i) => Math.max(m, i.weight), 0);
-                           return Math.max(max, logMax);
-                        }, 0);
-                        
-                        if (maxWeight >= 100) autoBadges.push({ icon: '💪', name: '大力士', color: 'bg-red-100 text-red-700' });
-
-                        // Custom Badges
-                        const customBadges = student.customBadges || [];
-                        const allBadges = [...autoBadges, ...customBadges];
-
-                        const BADGE_PRESETS = [
-                          { icon: '🔥', name: '熱血戰士', color: 'bg-red-100 text-red-700' },
-                          { icon: '🌟', name: '模範生', color: 'bg-yellow-100 text-yellow-700' },
-                          { icon: '🐢', name: '進步神速', color: 'bg-green-100 text-green-700' },
-                          { icon: '💧', name: '汗水之王', color: 'bg-blue-100 text-blue-700' },
-                          { icon: '🧘', name: '柔軟度大師', color: 'bg-purple-100 text-purple-700' },
-                          { icon: '⚡', name: '爆發力', color: 'bg-orange-100 text-orange-700' },
-                          { icon: '🦾', name: '鋼鐵意志', color: 'bg-gray-800 text-white' },
-                        ];
-
-                        return (
-                           <>
-                             <h3 className="font-bold text-lg mb-4 flex items-center gap-2">
-                               <Trophy className="w-5 h-5 text-[#ffcd38]" /> 
-                               成就系統 (Achievements)
-                             </h3>
-                             
-                             {/* Current Badges */}
-                             <div className="flex flex-wrap gap-2 mb-6">
-                                {allBadges.length === 0 ? (
-                                   <div className="text-gray-400 text-sm italic">尚無任何成就</div>
-                                ) : (
-                                   allBadges.map((b, i) => (
-                                     <div key={i} className={`px-3 py-1 rounded-full border-2 border-black/10 flex items-center gap-2 font-bold text-sm ${b.color} relative group`}>
-                                        <span>{b.icon} {b.name}</span>
-                                        {/* Only allow deleting custom badges */}
-                                        {customBadges.some(cb => cb.name === b.name) && (
-                                          <button 
-                                            onClick={() => {
-                                               const newBadges = customBadges.filter(cb => cb.name !== b.name);
-                                               updateBadges(student.id, newBadges);
-                                            }}
-                                            className="ml-2 w-4 h-4 bg-black/10 rounded-full flex items-center justify-center hover:bg-red-500 hover:text-white transition-colors"
-                                            title="移除此成就"
-                                          >
-                                            <X className="w-3 h-3" />
-                                          </button>
-                                        )}
-                                     </div>
-                                   ))
-                                )}
-                             </div>
-
-                             {/* Add Badge Controls */}
-                             {(currentUser.role === 'coach' || currentUser.name === 'iisa') && (
-                               <div className="bg-gray-50 p-4 border-2 border-dashed border-gray-300 rounded">
-                                 <p className="text-xs font-bold text-gray-500 mb-2 uppercase">頒發新成就 (Award New Badge)</p>
-                                 <div className="flex flex-wrap gap-2">
-                                    {BADGE_PRESETS.filter(p => !customBadges.some(cb => cb.name === p.name) && !autoBadges.some(ab => ab.name === p.name)).map(preset => (
-                                       <button
-                                         key={preset.name}
-                                         onClick={() => {
-                                            const newBadges = [...customBadges, preset];
-                                            updateBadges(student.id, newBadges);
-                                         }}
-                                         className={`px-2 py-1 text-xs rounded border border-gray-300 hover:border-black hover:bg-white transition-all flex items-center gap-1 opacity-60 hover:opacity-100 grayscale hover:grayscale-0 bg-white`}
-                                       >
-                                         {preset.icon} {preset.name}
-                                       </button>
-                                    ))}
-                                 </div>
-                               </div>
-                             )}
-                           </>
-                        );
-                     })()}
                   </div>
 
                   <div className="flex-1 overflow-y-auto p-6 bg-gray-100">
                      {studentLogs.length === 0 ? (
                        <div className="text-center py-20 text-gray-400">
                          <Dumbbell className="w-16 h-16 mx-auto mb-4 opacity-20" />
-                         <p className="font-bold">尚無健身紀錄 (No Logs)</p>
+                         <p className="font-bold">尚無健身紀錄</p>
                        </div>
                      ) : (
                        <div className="space-y-4">
@@ -1319,16 +1607,11 @@ export default function App() {
             動作圖鑑
           </button>
           <button 
-            onClick={() => setActiveTab('pk')}
-            className={`flex items-center gap-2 px-6 py-3 font-bold border-4 transition-all relative ${activeTab === 'pk' ? 'bg-[#ff6b6b] border-black shadow-[4px_4px_0_0_black] -translate-y-1 text-white' : 'bg-gray-100 border-transparent text-gray-500 hover:bg-gray-200'}`}
+            onClick={() => setActiveTab('achievements')}
+            className={`flex items-center gap-2 px-6 py-3 font-bold border-4 transition-all relative ${activeTab === 'achievements' ? 'bg-[#ff6b6b] border-black shadow-[4px_4px_0_0_black] -translate-y-1 text-white' : 'bg-gray-100 border-transparent text-gray-500 hover:bg-gray-200'}`}
           >
-            <Sword className="w-5 h-5" />
-            PK 對戰板
-            {battles.filter(b => b.targetStudentId === currentUser.id && !b.records?.some(r => r.studentId === currentUser.id)).length > 0 && (
-              <span className="absolute -top-2 -right-2 w-5 h-5 bg-red-500 text-white text-[10px] flex items-center justify-center rounded-full border-2 border-white shadow-sm animate-pulse">
-                 {battles.filter(b => b.targetStudentId === currentUser.id && !b.records?.some(r => r.studentId === currentUser.id)).length}
-              </span>
-            )}
+            <Trophy className="w-5 h-5" />
+            成就
           </button>
           {currentUser.name === 'iisa' && (
              <button 
@@ -1366,138 +1649,35 @@ export default function App() {
               {currentUser.role === 'student' && (
                 <>
                   <PixelCard 
-                    className="border-dashed border-gray-400 bg-gray-50 p-4 md:p-6 flex flex-row md:flex-col items-center justify-center gap-4 hover:bg-gray-100 transition-colors cursor-pointer group mb-6" 
+                    variant="accent"
+                    className="p-4 md:p-6 flex flex-row md:flex-col items-center justify-center gap-4 cursor-pointer group mb-6 shadow-[6px_6px_0_0_black] hover:shadow-[2px_2px_0_0_black] hover:translate-x-1 hover:translate-y-1 transition-all border-4 border-black" 
                     onClick={() => setIsLogModalOpen(true)}
                   >
-                    <div className="w-12 h-12 md:w-16 md:h-16 rounded-full bg-white border-4 border-black flex items-center justify-center group-hover:scale-110 transition-transform shadow-[4px_4px_0_0_rgba(0,0,0,0.2)] flex-shrink-0">
-                      <Plus className="w-5 h-5 md:w-8 md:h-8 text-[#ff6b6b]" />
+                    <div className="w-12 h-12 md:w-16 md:h-16 rounded-full bg-white border-4 border-black flex items-center justify-center group-hover:scale-110 transition-transform flex-shrink-0">
+                      <Plus className="w-5 h-5 md:w-8 md:h-8 text-black" />
                     </div>
-                    <h3 className="font-bold text-base md:text-xl text-gray-500 group-hover:text-black">記錄今日戰果 (Log New Workout)</h3>
+                    <h3 className="font-bold text-base md:text-xl text-black">記錄今日戰果</h3>
                   </PixelCard>
 
-                  {isLogModalOpen && (
-                    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4 animate-in fade-in duration-200">
-                      <div className="w-full max-w-2xl max-h-[90vh] overflow-y-auto">
-                        <PixelCard className="relative shadow-[8px_8px_0_0_#4ecdc4] border-4 border-black">
-                          <button 
-                            onClick={() => setIsLogModalOpen(false)}
-                            className="absolute top-4 right-4 text-gray-400 hover:text-black bg-white border-2 border-black p-1 hover:bg-red-100"
-                          >
-                            <X className="w-6 h-6" />
-                          </button>
-
-                          <h2 className="text-xl font-bold mb-4 flex items-center gap-2 border-b-4 border-black pb-2 text-[#ff6b6b]">
-                            <Dumbbell className="w-6 h-6" /> 記錄今日戰果 (Daily Workout)
-                          </h2>
-                          
-                          {/* Current Items List */}
-                          {currentSessionItems.length > 0 && (
-                            <div className="mb-6 space-y-2">
-                              <h4 className="font-bold text-gray-500 text-sm uppercase">本次項目 (Items)</h4>
-                              {currentSessionItems.map((item, idx) => (
-                                <div key={item.id} className="bg-gray-100 border-2 border-gray-300 p-2 flex justify-between items-center text-sm">
-                                   <div className="flex gap-2 items-center">
-                                      <span className="bg-black text-white w-5 h-5 flex items-center justify-center text-xs font-bold rounded-full">{idx + 1}</span>
-                                      <span className="font-bold">{item.exercise}</span>
-                                      <span className="text-gray-500">{item.weight}kg x {item.sets}組 x {item.reps}下</span>
-                                   </div>
-                                   <button onClick={() => handleRemoveItem(item.id)} className="text-red-500 hover:text-red-700">
-                                      <Trash2 size={16} />
-                                   </button>
-                                </div>
-                              ))}
-                            </div>
-                          )}
-
-                          <div className="space-y-4 border-b-4 border-dotted border-gray-300 pb-6 mb-6">
-                            <div className="grid grid-cols-2 gap-4">
-                              <div>
-                                <PixelInput 
-                                  label="項目 (Exercise)" 
-                                  placeholder="e.g. Bench Press" 
-                                  value={newItem.exercise}
-                                  list="exercise-list"
-                                  onChange={e => {
-                                    const val = e.target.value;
-                                    // Only search within visible exercises to maintain consistency
-                                    const existingExercise = getVisibleExercises().find(ex => ex.name.toLowerCase() === val.toLowerCase());
-                                    
-                                    // Try to find muscle from history if not in Wiki
-                                    let muscleToFill = existingExercise ? existingExercise.muscle : prev.muscle;
-                                    
-                                    if (!existingExercise && currentUser && val.trim()) {
-                                       const myLogs = logs.filter(l => l.studentId === currentUser.id);
-                                       for (const log of myLogs) {
-                                          const foundItem = log.items.find(item => item.exercise.toLowerCase() === val.toLowerCase());
-                                          if (foundItem && foundItem.muscle) {
-                                             muscleToFill = foundItem.muscle;
-                                             break; // Use the most recent muscle info
-                                          }
-                                       }
-                                    }
-
-                                    setNewItem(prev => ({
-                                      ...prev,
-                                      exercise: val,
-                                      muscle: muscleToFill
-                                    }));
-                                  }}
-                                />
-                                <datalist id="exercise-list">
-                                  {getAvailableExerciseNames().map((name, i) => (
-                                    <option key={i} value={name} />
-                                  ))}
-                                </datalist>
-                              </div>
-                              <PixelInput 
-                                label="部位 (Muscle)" 
-                                placeholder="e.g. Chest" 
-                                value={newItem.muscle}
-                                onChange={e => setNewItem({...newItem, muscle: e.target.value})}
-                              />
-                            </div>
-                            <div className="grid grid-cols-3 gap-4">
-                              <PixelInput 
-                                label="重量 (Kg)" 
-                                type="number" 
-                                placeholder="0" 
-                                value={newItem.weight}
-                                onChange={e => setNewItem({...newItem, weight: e.target.value})}
-                              />
-                              <PixelInput 
-                                label="組數 (Sets)" 
-                                type="number" 
-                                placeholder="0" 
-                                value={newItem.sets}
-                                onChange={e => setNewItem({...newItem, sets: e.target.value})}
-                              />
-                              <PixelInput 
-                                label="次數 (Reps)" 
-                                type="number" 
-                                placeholder="0" 
-                                value={newItem.reps}
-                                onChange={e => setNewItem({...newItem, reps: e.target.value})}
-                              />
-                            </div>
-                            <PixelButton type="button" onClick={handleAddItem} variant="outline" className="w-full border-dashed">
-                              <Plus className="w-4 h-4" /> 增加項目 (Add Item)
-                            </PixelButton>
-                          </div>
-                          
-                          <div className="space-y-4">
-                            <PixelInput 
-                              label="整組心得/筆記 (Session Notes)" 
-                              placeholder="今天的狀況如何？" 
-                              value={sessionNotes}
-                              onChange={e => setSessionNotes(e.target.value)}
-                            />
-                            <PixelButton onClick={handleSubmitSession} className="w-full" variant="primary">
-                               完成今日鍛鍊 (FINISH WORKOUT)
-                            </PixelButton>
-                          </div>
-                        </PixelCard>
-                      </div>
-                    </div>
+                  {/* Pinned Achievements */}
+                  {currentUser.selectedBadgeIds && currentUser.selectedBadgeIds.length > 0 && (
+                     <div className="mb-6 animate-in slide-in-from-top-2 duration-300">
+                        <h3 className="font-bold text-lg mb-2 flex items-center gap-2 border-b-2 border-black pb-1">
+                           <Trophy className="w-5 h-5 text-[#ffcd38]" /> 
+                           我的榮耀 (My Glory)
+                        </h3>
+                        <div className="flex flex-wrap gap-2">
+                           {systemAchievements
+                              .filter(ach => currentUser.selectedBadgeIds?.includes(ach.id))
+                              .map(ach => (
+                                 <div key={ach.id} className="bg-white border-4 border-black px-4 py-2 shadow-[4px_4px_0_0_black] flex items-center gap-2">
+                                    <span className="text-2xl">{ach.icon}</span>
+                                    <span className="font-bold text-sm">{ach.name}</span>
+                                 </div>
+                              ))
+                           }
+                        </div>
+                     </div>
                   )}
                 </>
               )}
@@ -1510,9 +1690,12 @@ export default function App() {
                      <div className="space-y-6">
                         <div className="flex justify-between items-center border-b-4 border-black pb-4">
                            <h3 className="font-bold text-lg text-[#ff6b6b] flex items-center gap-2">
-                              <User className="w-5 h-5"/> 我的學員 (My Students)
+                              <User className="w-5 h-5"/> 我的學員
                            </h3>
-                           <PixelBadge>{users.filter(u => u.coachId === currentUser.id).length} Students</PixelBadge>
+                           <div className="flex items-center gap-2">
+
+                                <PixelBadge>{users.filter(u => u.coachId === currentUser.id).length} Students</PixelBadge>
+                           </div>
                         </div>
 
                         {(() => {
@@ -1535,18 +1718,47 @@ export default function App() {
                                     const pendingReviewCount = studentLogs.filter(l => !l.coachComment && l.score === undefined).length;
                                     
                                     // Calculate Badges
-                                    const badges = [];
-                                    if (totalWorkouts >= 1) badges.push({ icon: '🏅', name: '新手上路', color: 'bg-green-100 text-green-700' });
-                                    if (totalWorkouts >= 10) badges.push({ icon: '🥉', name: '持之以恆', color: 'bg-orange-100 text-orange-700' });
-                                    if (totalWorkouts >= 30) badges.push({ icon: '🥈', name: '健身運動員', color: 'bg-gray-100 text-gray-700' });
-                                    if (totalWorkouts >= 50) badges.push({ icon: '🥇', name: '健身菁英', color: 'bg-yellow-100 text-yellow-700' });
+                                    const badges: any[] = [];
                                     
+                                    // System Badges
+                                    systemAchievements.forEach(ach => {
+                                       if (student.name === 'mega' && ach.id === 'newbie') return;
+                                       if (checkAchievement(ach, studentLogs)) {
+                                          badges.push({ icon: ach.icon, name: ach.name, color: ach.color, id: ach.id });
+                                       }
+                                    });
+
+                                    // Coach Defined Badges
+                                    const coach = users.find(u => u.id === student.coachId);
+                                    if (coach && coach.definedAchievements) {
+                                        coach.definedAchievements.forEach(ach => {
+                                            if (checkAchievement(ach, studentLogs)) {
+                                                badges.push({ icon: ach.icon, name: ach.title, color: 'bg-blue-100 text-blue-700', id: ach.id });
+                                            }
+                                        });
+                                    }
+                                    
+                                    // Calculate Max Weight (for stats)
                                     const maxWeight = studentLogs.reduce((max, log) => {
                                        const logMax = log.items.reduce((m, i) => Math.max(m, i.weight), 0);
                                        return Math.max(max, logMax);
                                     }, 0);
-                                    
-                                    if (maxWeight >= 100) badges.push({ icon: '💪', name: '大力士', color: 'bg-red-100 text-red-700' });
+
+                                    // Add Custom Badges
+                                    if (student.customBadges) {
+                                       badges.push(...student.customBadges);
+                                    }
+
+                                    // Sort by Selection (Pinned First)
+                                    if (student.selectedBadgeIds && student.selectedBadgeIds.length > 0) {
+                                        badges.sort((a, b) => {
+                                            const aSelected = a.id && student.selectedBadgeIds?.includes(a.id);
+                                            const bSelected = b.id && student.selectedBadgeIds?.includes(b.id);
+                                            if (aSelected && !bSelected) return -1;
+                                            if (!aSelected && bSelected) return 1;
+                                            return 0;
+                                        });
+                                    }
 
                                     return (
                                        <div key={student.id} 
@@ -1555,7 +1767,7 @@ export default function App() {
                                        >
                                           {pendingReviewCount > 0 && (
                                              <div className="absolute top-0 right-0 bg-[#ff6b6b] text-white text-xs font-bold px-2 py-1 animate-pulse z-10">
-                                                {pendingReviewCount} 待審核
+                                                {pendingReviewCount} 待查看
                                              </div>
                                           )}
                                           
@@ -1611,7 +1823,7 @@ export default function App() {
                                                e.stopPropagation();
                                                setViewingStudentId(student.id);
                                             }}>
-                                              <BookOpen className="w-4 h-4 mr-2" /> {student.status === 'disabled' ? '檢視紀錄 (View Logs)' : '審核日記 (Review Logs)'}
+                                              <BookOpen className="w-4 h-4 mr-2" /> {student.status === 'disabled' ? '檢視紀錄' : '查看日記'}
                                             </PixelButton>
                                           </div>
                                        </div>
@@ -1624,36 +1836,71 @@ export default function App() {
                   ) : (
                      /* Mode 2: Log List (Detail View) */
                      <div className="space-y-6 animate-in slide-in-from-right-4">
-                        <div className="flex items-center gap-4 border-b-4 border-black pb-4">
-                           <button 
-                              onClick={() => setViewingStudentId(null)}
-                              className="bg-white border-2 border-black p-2 hover:bg-gray-100 transition-colors"
-                           >
-                              <ChevronDown className="w-5 h-5 rotate-90" />
-                           </button>
-                           <div className="flex items-center gap-3">
-                              <div className="w-10 h-10 bg-[#4ecdc4] rounded-full border-2 border-white flex items-center justify-center text-black font-bold shadow-md">
-                                 {users.find(u => u.id === viewingStudentId)?.name[0] || '?'}
-                              </div>
-                              <div>
-                                 <h3 className="font-bold text-xl leading-none flex items-center gap-2">
-                                    {users.find(u => u.id === viewingStudentId)?.name}
-                                    {users.find(u => u.id === viewingStudentId)?.status === 'disabled' && (
-                                       <span className="text-xs bg-red-100 text-red-600 px-2 py-0.5 rounded border border-red-200 font-bold whitespace-nowrap">
-                                          ⚠️ 帳號已停用 (Disabled)
-                                       </span>
-                                    )}
-                                 </h3>
-                                 <span className="text-xs text-gray-500 font-mono">
-                                    {getVisibleLogs().length} 篇日記
-                                    {getVisibleLogs().filter(l => !l.coachComment).length > 0 && (
-                                       <span className="text-[#ff6b6b] font-bold ml-2">
-                                          • {getVisibleLogs().filter(l => !l.coachComment).length} 待審核 (Pending)
-                                       </span>
-                                    )}
-                                 </span>
+                        <div className="flex justify-between items-center border-b-4 border-black pb-4">
+                           <div className="flex items-center gap-4">
+                              <button 
+                                 onClick={() => setViewingStudentId(null)}
+                                 className="bg-white border-2 border-black p-2 hover:bg-gray-100 transition-colors"
+                              >
+                                 <ChevronDown className="w-5 h-5 rotate-90" />
+                              </button>
+                              <div className="flex items-center gap-3">
+                                 <div className="w-10 h-10 bg-[#4ecdc4] rounded-full border-2 border-white flex items-center justify-center text-black font-bold shadow-md">
+                                    {users.find(u => u.id === viewingStudentId)?.name[0] || '?'}
+                                 </div>
+                                 <div>
+                                    <h3 className="font-bold text-xl leading-none flex items-center gap-2">
+                                       {users.find(u => u.id === viewingStudentId)?.name}
+                                       {users.find(u => u.id === viewingStudentId)?.status === 'disabled' && (
+                                          <span className="text-xs bg-red-100 text-red-600 px-2 py-0.5 rounded border border-red-200 font-bold whitespace-nowrap">
+                                             ⚠️ 帳號已停用
+                                          </span>
+                                       )}
+                                    </h3>
+                                    <span className="text-xs text-gray-500 font-mono">
+                                       {getVisibleLogs().length} 篇日記
+                                    </span>
+                                 </div>
                               </div>
                            </div>
+                        </div>
+
+                        {/* Stats & Actions Grid - Moved Up & Enhanced */}
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-6">
+                           {/* Assign Plan Button - Matching Student's "Record Result" style */}
+                           <PixelCard 
+                             variant="accent"
+                             className="p-4 flex items-center justify-center gap-4 cursor-pointer group shadow-[4px_4px_0_0_black] hover:shadow-[2px_2px_0_0_black] hover:translate-x-1 hover:translate-y-1 transition-all border-4 border-black" 
+                             onClick={() => {
+                                setNewItem({ exercise: '', weight: '', reps: '10', sets: '3', muscle: '' });
+                                setIsLogModalOpen(true);
+                             }}
+                           >
+                             <div className="w-12 h-12 rounded-full bg-white border-4 border-black flex items-center justify-center group-hover:scale-110 transition-transform flex-shrink-0">
+                               <Plus className="w-6 h-6 text-black" />
+                             </div>
+                             <h3 className="font-bold text-xl text-black">指派課表</h3>
+                           </PixelCard>
+
+                           {/* Stats - Moved from sidebar */}
+                           <PixelCard className="bg-white border-4 border-gray-200 p-4">
+                             <div className="flex flex-row gap-4 justify-center items-center">
+                                <div className="flex-1 text-center">
+                                   <Flame className="w-8 h-8 mx-auto mb-1 text-gray-300" />
+                                   <div className="text-2xl font-bold text-gray-800">{getVisibleLogs().length}</div>
+                                   <div className="text-xs font-bold uppercase text-gray-400">Total Workouts</div>
+                                </div>
+                                <div className="w-0.5 h-12 bg-gray-200 dashed self-center"></div>
+                                <div className="flex-1 text-center">
+                                   <div className="w-8 h-8 mx-auto mb-1 flex items-center justify-center text-gray-300 font-black text-xl">M</div>
+                                   <div className="text-2xl font-bold text-black flex justify-center items-baseline gap-0.5">
+                                      {Math.max(0, ...getVisibleLogs().flatMap(l => l.items).map(i => Number(i.weight) || 0))} 
+                                      <span className="text-[10px] text-gray-400">kg</span>
+                                   </div>
+                                   <div className="text-xs text-gray-400 uppercase font-bold">History Max</div>
+                                </div>
+                             </div>
+                           </PixelCard>
                         </div>
 
                         {getVisibleLogs().length === 0 ? (
@@ -1669,56 +1916,63 @@ export default function App() {
                                  const isDisabled = student?.status === 'disabled';
                                  
                                  return (
-                                   <div key={log.id} className={`transition-all ${log.isHidden ? 'opacity-50 grayscale' : ''} ${isDisabled ? 'grayscale opacity-80' : ''}`}>
-                                      <PixelCard className={`border-black border-4 shadow-[6px_6px_0_0_rgba(0,0,0,0.2)] p-0 overflow-hidden relative ${!isExpanded ? 'bg-gray-50' : ''}`}>
-                                         {/* Header Bar */}
-                                         <div 
-                                           className="bg-gray-900 text-white p-3 flex justify-between items-center cursor-pointer hover:bg-gray-800 transition-colors"
+                                   <div key={log.id} className={`bg-white border-2 border-black shadow-[4px_4px_0_0_rgba(0,0,0,0.1)] overflow-hidden transition-all ${log.isHidden ? 'opacity-50 grayscale' : ''} ${isDisabled ? 'grayscale opacity-80' : ''}`}>
+                                      {/* Header Bar */}
+                                      <div 
+                                        className="flex justify-between items-center p-4 border-b border-gray-100 cursor-pointer hover:bg-gray-50 transition-colors"
                                            onClick={() => toggleLogExpansion(log.id)}
                                          >
+                                         <div className="flex flex-col gap-1">
                                             <div className="flex items-center gap-2">
-                                               <div className="flex flex-col">
-                                                 <span className="font-bold block text-sm">{format(log.date, 'MM/dd')} (週{format(log.date, 'iiiii')})</span>
-                                                 {/* Collapsed Summary */}
-                                                 {!isExpanded && (
-                                                    <span className="text-[10px] text-gray-400 font-mono">
-                                                       {log.items.length} Items ({log.items.map(i => i.exercise).slice(0, 2).join(', ')}{log.items.length > 2 ? '...' : ''})
-                                                    </span>
-                                                 )}
-                                               </div>
+                                               <span className="font-bold text-lg text-gray-800">{format(new Date(log.date), 'yyyy-MM-dd')}</span>
+                                               <span className="ml-2 text-xs bg-black text-[#ffcd38] px-2 py-0.5 font-bold border border-black">
+                                                  MAX {log.items.length > 0 ? Math.max(...log.items.map(i => Number(i.weight) || 0)) : 0}kg
+                                               </span>
+                                               {!isExpanded && (
+                                                 <span className="text-xs text-gray-400 font-mono hidden md:inline-block">
+                                                    • {log.items.length} Items ({log.items.map(i => i.exercise).slice(0, 2).join(', ')}{log.items.length > 2 ? '...' : ''})
+                                                 </span>
+                                               )}
                                             </div>
-                                            <div className="flex gap-2 items-center">
-                                               <div className="flex gap-2 mr-2">
-                                                 <button onClick={(e) => { e.stopPropagation(); toggleHideLog(log.id); }} className="hover:text-[#4ecdc4] transition-colors" title={log.isHidden ? "顯示" : "隱藏"}>
-                                                    {log.isHidden ? <EyeOff size={18} /> : <Eye size={18} />}
-                                                 </button>
-                                                 <button onClick={(e) => { e.stopPropagation(); deleteLog(log.id); }} className="hover:text-[#ff6b6b] transition-colors" title="刪除">
-                                                    <Trash2 size={18} />
-                                                 </button>
+                                            
+                                            {/* Mobile Summary */}
+                                            {!isExpanded && (
+                                               <div className="text-xs text-gray-400 font-mono md:hidden mt-1">
+                                                  {log.items.length} Items: {log.items.map(i => i.exercise).slice(0, 1).join(', ')}{log.items.length > 1 ? '...' : ''}
                                                </div>
-                                               <div className="text-gray-500">
-                                                 {isExpanded ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}
-                                               </div>
+                                            )}
+                                         </div>
+                                         
+                                         <div className="flex items-center gap-3">
+                                            <button 
+                                              onClick={(e) => { e.stopPropagation(); handleDuplicateLog(log); }}
+                                              className="text-gray-300 hover:text-black transition-colors"
+                                              title="複製到新課表"
+                                            >
+                                              <Plus className="w-4 h-4" />
+                                            </button>
+                                            <button onClick={(e) => { e.stopPropagation(); toggleHideLog(log.id); }} className="text-gray-300 hover:text-[#4ecdc4] transition-colors" title={log.isHidden ? "顯示" : "隱藏"}>
+                                               {log.isHidden ? <EyeOff size={18} /> : <Eye size={18} />}
+                                            </button>
+                                            <button onClick={(e) => { e.stopPropagation(); deleteLog(log.id); }} className="text-gray-300 hover:text-red-500 transition-colors" title="刪除">
+                                               <Trash2 size={18} />
+                                            </button>
+                                            <div className="text-gray-400">
+                                               {isExpanded ? <ChevronUp className="w-5 h-5" /> : <ChevronDown className="w-5 h-5" />}
                                             </div>
+                                         </div>
                                          </div>
                                          
                                          {/* Content */}
                                          {isExpanded && (
                                          <div className="p-4 animate-in slide-in-from-top-2 duration-200">
-                                            <div className="mb-4 flex justify-between items-center border-b-2 border-gray-100 pb-2">
-                                               <span className="font-bold text-lg text-gray-800">健身日記</span>
-                                               <div className="text-xs font-mono text-gray-400">
-                                                  {format(log.date, 'yyyy/MM/dd HH:mm')}
-                                               </div>
-                                            </div>
-
                                             <div className="space-y-2 mb-4">
                                                {log.items.map((item, idx) => (
-                                                 <div key={item.id} className="flex justify-between items-center text-sm p-2 bg-gray-50 border border-gray-200">
+                                                 <div key={item.id} className="flex justify-between items-center text-sm border-b border-gray-100 last:border-0 py-1">
                                                     <div className="flex items-center gap-2">
-                                                       <span className="text-gray-400 font-bold w-4">{idx + 1}.</span>
+                                                       <span className="text-gray-300 font-bold w-4">{idx + 1}.</span>
                                                        <span className="font-bold">{item.exercise}</span>
-                                                       <PixelBadge variant="warning" className="text-[10px] py-0">{item.muscle}</PixelBadge>
+                                                       <span className="text-xs bg-gray-100 px-1 rounded text-gray-500">{item.muscle}</span>
                                                     </div>
                                                     <div className="font-mono font-bold text-gray-600">
                                                        {item.weight}kg x {item.sets}組 x {item.reps}
@@ -1727,14 +1981,15 @@ export default function App() {
                                                ))}
                                             </div>
                                             
-                                            <div className="bg-[#fffbeb] border-2 border-[#fcd34d] p-3 mb-4 text-sm text-gray-600 relative">
-                                               <span className="absolute -top-2 left-2 bg-[#fffbeb] px-1 text-xs font-bold text-[#b45309]">學員心得</span>
-                                               {log.notes || "無筆記"}
-                                            </div>
+                                            {log.notes && (
+                                               <div className="text-xs text-gray-500 bg-gray-50 p-2 border border-gray-200 italic mb-2">
+                                                  "{log.notes}"
+                                               </div>
+                                            )}
 
                                             {/* Coach Feedback Section */}
                                             {(() => {
-                                              const isGraded = log.score !== undefined || !!log.coachComment;
+                                              const isGraded = !!log.coachComment;
                                               const isDisabled = student?.status === 'disabled';
                                               
                                               return (
@@ -1743,10 +1998,7 @@ export default function App() {
                                                       {isGraded && (
                                                          <div className="flex items-center gap-2 mb-1 text-[#2c7a7b] font-bold text-xs uppercase tracking-wider">
                                                             <CheckCircle className="w-4 h-4" /> 
-                                                            <span>已完成評分 (Graded)</span>
-                                                            {commentingCoach && (
-                                                               <span className="text-gray-500 font-normal normal-case">- by {commentingCoach.name}</span>
-                                                            )}
+                                                            <span>已完成留言</span>
                                                             {log.coachCommentDate && (
                                                                <span className="text-gray-400 font-normal normal-case text-[10px] ml-auto">
                                                                   {format(new Date(log.coachCommentDate), 'MM/dd HH:mm')}
@@ -1755,21 +2007,7 @@ export default function App() {
                                                          </div>
                                                       )}
                                                       
-                                                      <div className="flex items-center gap-4">
-                                                         <label className="font-bold text-sm flex items-center gap-1">
-                                                            <Star className={`w-4 h-4 ${isGraded ? 'text-[#38b2ac]' : 'text-[#ffcd38]'} fill-current`} /> 評分:
-                                                         </label>
-                                                         <input 
-                                                            type="number" 
-                                                            min="0" 
-                                                            max="100" 
-                                                            defaultValue={log.score}
-                                                            disabled={isDisabled}
-                                                            className={`w-20 border-2 ${isGraded ? 'border-[#38b2ac]' : 'border-black'} p-1 text-center font-bold bg-white disabled:bg-gray-100 disabled:text-gray-400 disabled:border-gray-300`}
-                                                            placeholder="0-100"
-                                                            id={`score-${log.id}`}
-                                                         />
-                                                      </div>
+
                                                       <div className="flex gap-2">
                                                          <input 
                                                             type="text" 
@@ -1786,15 +2024,14 @@ export default function App() {
                                                             className={`${isGraded ? 'bg-white text-[#2c7a7b] border-[#2c7a7b] hover:bg-[#e6fffa]' : ''} ${isDisabled ? 'opacity-50 cursor-not-allowed' : ''}`}
                                                             onClick={() => {
                                                                if (isDisabled) return;
-                                                               const scoreInput = document.getElementById(`score-${log.id}`) as HTMLInputElement;
                                                                const commentInput = document.getElementById(`comment-${log.id}`) as HTMLInputElement;
-                                                               updateLogFeedback(log.id, Number(scoreInput.value), commentInput.value);
+                                                               updateLogFeedback(log.id, commentInput.value);
                                                             }}
                                                          >
                                                             {isGraded ? (
                                                               <><MessageSquare className="w-4 h-4" /> 更新</>
                                                             ) : (
-                                                              <><MessageSquare className="w-4 h-4" /> ���分</>
+                                                              <><MessageSquare className="w-4 h-4" /> 留言</>
                                                             )}
                                                          </PixelButton>
                                                       </div>
@@ -1804,7 +2041,6 @@ export default function App() {
                                             })()}
                                          </div>
                                          )}
-                                      </PixelCard>
                                    </div>
                                  );
                               })}
@@ -1816,57 +2052,148 @@ export default function App() {
               ) : (
                 /* MEMBER VIEW: Log History */
                 <div className="space-y-4">
-                  <h3 className="font-bold text-lg text-gray-500">紀錄 (Logs)</h3>
+                  <h3 className="font-bold text-lg text-gray-500">紀錄</h3>
                   {getVisibleLogs().length === 0 ? (
                     <div className="text-center py-10 border-4 border-dashed border-gray-300 text-gray-400">
                       尚無記錄，快開始鍛鍊吧！
                     </div>
                   ) : (
                     getVisibleLogs().map(log => {
+                      // Check if it's a plan
+                      if (log.isPlan) {
+                          return (
+                              <PixelCard 
+                                key={log.id} 
+                                className={`border-dashed ${log.sharedFrom ? 'border-[#4ecdc4]' : 'border-[#ffcd38]'} bg-[#fffff0] p-4 cursor-pointer hover:scale-[1.02] transition-transform relative overflow-hidden group mb-4`}
+                                onClick={() => {
+                                    setCurrentSessionItems(log.items);
+                                    setSessionNotes(log.notes);
+                                    setActiveLogId(log.id);
+                                    setIsLogModalOpen(true);
+                                }}
+                              >
+                                 <div className={`absolute top-0 right-0 ${log.sharedFrom ? 'bg-[#4ecdc4]' : 'bg-[#ffcd38]'} text-black text-xs font-bold px-3 py-1 z-10`}>
+                                    {log.sharedFrom ? '學員分享課表 (Shared)' : '待執行課表 (Assigned)'}
+                                 </div>
+                                 <div className="flex items-center gap-4 mb-2">
+                                    <div className={`w-12 h-12 rounded-full bg-white border-4 ${log.sharedFrom ? 'border-[#4ecdc4]' : 'border-[#ffcd38]'} flex items-center justify-center shrink-0`}>
+                                       {log.sharedFrom ? <Share2 className="w-6 h-6 text-[#4ecdc4]" /> : <Dumbbell className="w-6 h-6 text-[#ffcd38]" />}
+                                    </div>
+                                    <div>
+                                       <h3 className="font-bold text-lg">
+                                           {log.sharedFrom ? '學員分享課表 (Shared Plan)' : '教練指派課表 (Coach Assigned)'}
+                                       </h3>
+                                       <div className="text-xs text-gray-500 font-mono">{log.items.length} 項目 • {format(new Date(log.date), 'yyyy/MM/dd')}</div>
+                                    </div>
+                                 </div>
+                                 <div className="pl-16 space-y-1 mb-3">
+                                    {log.items.slice(0, 3).map((item, i) => (
+                                       <div key={i} className="text-sm text-gray-600 font-mono">
+                                          • <span className="font-bold">{item.exercise}</span> <span className="text-xs text-gray-400">({item.sets} x {item.reps})</span>
+                                       </div>
+                                    ))}
+                                    {log.items.length > 3 && <div className="text-xs text-gray-400">...and {log.items.length - 3} more</div>}
+                                 </div>
+                                 
+                                 {log.notes && (
+                                    <div className={`ml-16 mb-3 bg-white/50 p-2 text-xs italic text-gray-500 border-l-2 ${log.sharedFrom ? 'border-[#4ecdc4]' : 'border-[#ffcd38]'}`}>
+                                       {log.sharedFrom ? '分享備註' : '教練筆記'}: "{log.notes}"
+                                    </div>
+                                 )}
+                                 
+                                 <div className={`mt-2 pt-2 border-t-2 border-dashed ${log.sharedFrom ? 'border-[#4ecdc4]/30' : 'border-[#ffcd38]/30'} flex justify-end gap-2`}>
+                                     <button 
+                                        className="text-gray-400 hover:text-red-500 p-2"
+                                        onClick={(e) => {
+                                            e.stopPropagation();
+                                            deleteLog(log.id);
+                                        }}
+                                     >
+                                        <Trash2 className="w-4 h-4" />
+                                     </button>
+                                     <button className={`${log.sharedFrom ? 'bg-[#4ecdc4]' : 'bg-[#ffcd38]'} text-black font-bold px-4 py-2 border-2 border-black shadow-[2px_2px_0_0_black] hover:translate-y-[1px] hover:shadow-[1px_1px_0_0_black] transition-all text-sm flex items-center gap-2`}>
+                                        <Plus className="w-4 h-4" /> 開始鍛鍊
+                                     </button>
+                                 </div>
+                              </PixelCard>
+                          );
+                      }
+
                       const isExpanded = expandedLogs.includes(log.id);
                       
-                      return (
-                      <div key={log.id} className="bg-white border-2 border-black shadow-[4px_4px_0_0_rgba(0,0,0,0.1)] overflow-hidden">
-                        {/* Header / Summary - Always Visible */}
-                        <div 
-                           className="flex justify-between items-center p-4 border-b border-gray-100 cursor-pointer hover:bg-gray-50 transition-colors"
-                           onClick={() => toggleLogExpansion(log.id)}
-                        >
-                           <div className="flex flex-col gap-1">
-                              <div className="flex items-center gap-2">
-                                 <span className="font-bold text-lg text-gray-800">Workout Session</span>
-                                 {!isExpanded && (
-                                   <span className="text-xs text-gray-400 font-mono hidden md:inline-block">
-                                      • {log.items.length} Items ({log.items.map(i => i.exercise).slice(0, 2).join(', ')}{log.items.length > 2 ? '...' : ''})
-                                   </span>
-                                 )}
-                              </div>
-                              <span className="text-xs font-mono text-gray-400">{format(log.date, 'yyyy/MM/dd HH:mm')}</span>
-                              
-                              {/* Mobile Summary */}
-                              {!isExpanded && (
-                                 <div className="text-xs text-gray-400 font-mono md:hidden mt-1">
-                                    {log.items.length} Items: {log.items.map(i => i.exercise).slice(0, 1).join(', ')}{log.items.length > 1 ? '...' : ''}
-                                 </div>
-                              )}
-                           </div>
-                           
-                           <div className="flex items-center gap-3">
-                              {/* Always show delete button for owner if needed, or hide inside expanded? Keeping it accessible is good but might clutter. Let's keep it here. */}
-                              {(currentUser.id === log.studentId || currentUser.role === 'coach') && (
-                                <button 
-                                  onClick={(e) => { e.stopPropagation(); deleteLog(log.id); }}
-                                  className="text-gray-300 hover:text-red-500 transition-colors"
-                                  title="Delete Log"
-                                >
-                                  <Trash2 className="w-4 h-4" />
-                                </button>
-                              )}
-                              <div className="text-gray-400">
-                                 {isExpanded ? <ChevronUp className="w-5 h-5" /> : <ChevronDown className="w-5 h-5" />}
-                              </div>
-                           </div>
-                        </div>
+                       return (
+                       <div key={log.id} className={`bg-white border-2 border-black shadow-[4px_4px_0_0_rgba(0,0,0,0.1)] overflow-hidden ${log.isShared ? 'border-l-8 border-l-[#4ecdc4]' : ''}`}>
+                         {/* Header / Summary - Always Visible */}
+                         <div 
+                            className="flex justify-between items-center p-4 border-b border-gray-100 cursor-pointer hover:bg-gray-50 transition-colors"
+                            onClick={() => toggleLogExpansion(log.id)}
+                         >
+                            <div className="flex flex-col gap-1">
+                               <div className="flex items-center gap-2">
+                                  {log.isShared && log.studentId !== currentUser.id && (
+                                      <span className="text-[10px] bg-[#4ecdc4] text-black px-1.5 py-0.5 rounded-full font-bold flex items-center gap-1">
+                                          <Share2 className="w-3 h-3" />
+                                          {users.find(u => u.id === log.studentId)?.name}
+                                      </span>
+                                  )}
+                                  <span className="font-bold text-lg text-gray-800">{format(new Date(log.date), 'yyyy-MM-dd')}</span>
+                                  <span className="ml-2 text-xs bg-black text-[#ffcd38] px-2 py-0.5 font-bold border border-black">
+                                     MAX {log.items.length > 0 ? Math.max(...log.items.map(i => Number(i.weight) || 0)) : 0}kg
+                                  </span>
+                                  {!isExpanded && (
+                                    <span className="text-xs text-gray-400 font-mono hidden md:inline-block">
+                                       • {log.items.length} Items ({log.items.map(i => i.exercise).slice(0, 2).join(', ')}{log.items.length > 2 ? '...' : ''})
+                                    </span>
+                                  )}
+                               </div>
+                               
+                               {/* Mobile Summary */}
+                               {!isExpanded && (
+                                  <div className="text-xs text-gray-400 font-mono md:hidden mt-1">
+                                     {log.items.length} Items: {log.items.map(i => i.exercise).slice(0, 1).join(', ')}{log.items.length > 1 ? '...' : ''}
+                                  </div>
+                               )}
+                            </div>
+                            
+                            <div className="flex items-center gap-3">
+                               <button 
+                                 onClick={(e) => { e.stopPropagation(); handleDuplicateLog(log); }}
+                                 className="text-gray-300 hover:text-black transition-colors"
+                                 title="複製到新日記"
+                               >
+                                 <Plus className="w-4 h-4" />
+                               </button>
+
+                               {currentUser.id === log.studentId && (
+                                   <button 
+                                     onClick={(e) => { 
+                                         e.stopPropagation(); 
+                                         setLogIdToShare(log.id);
+                                         setShareSelectedStudentIds([]);
+                                         setIsShareModalOpen(true);
+                                     }}
+                                     className="text-gray-300 hover:text-[#4ecdc4] transition-colors"
+                                     title="分享給同學"
+                                   >
+                                     <Share2 className="w-4 h-4" />
+                                   </button>
+                               )}
+
+                               {/* Always show delete button for owner if needed, or hide inside expanded? Keeping it accessible is good but might clutter. Let's keep it here. */}
+                               {(currentUser.id === log.studentId || currentUser.role === 'coach') && (
+                                 <button 
+                                   onClick={(e) => { e.stopPropagation(); deleteLog(log.id); }}
+                                   className="text-gray-300 hover:text-red-500 transition-colors"
+                                   title="Delete Log"
+                                 >
+                                   <Trash2 className="w-4 h-4" />
+                                 </button>
+                               )}
+                               <div className="text-gray-400">
+                                  {isExpanded ? <ChevronUp className="w-5 h-5" /> : <ChevronDown className="w-5 h-5" />}
+                               </div>
+                            </div>
+                         </div>
                         
                         {/* Expanded Content */}
                         {isExpanded && (
@@ -1897,7 +2224,12 @@ export default function App() {
                               <div className="mt-4 pt-3 border-t-2 border-dashed border-black bg-[#fff5f5] -mx-4 px-4 pb-2">
                                  <div className="flex items-center gap-2 mb-1">
                                     <User className="w-4 h-4 text-[#ff6b6b]" />
-                                    <span className="font-bold text-sm text-[#ff6b6b]">教練回饋 (Coach Feedback)</span>
+                                    <span className="font-bold text-sm text-[#ff6b6b]">教練回饋</span>
+                                    {users.find(u => u.id === log.coachIdWhoCommented) && (
+                                       <span className="text-gray-500 font-normal normal-case text-xs ml-1">
+                                          by {users.find(u => u.id === log.coachIdWhoCommented)?.name}
+                                       </span>
+                                    )}
                                     {log.coachCommentDate && (
                                        <span className="text-gray-400 font-normal normal-case text-[10px] ml-auto">
                                           {format(new Date(log.coachCommentDate), 'MM/dd HH:mm')}
@@ -1930,34 +2262,468 @@ export default function App() {
               )}
             </div>
 
-            {/* Sidebar Stats */}
-            {currentUser.role !== 'coach' && (
-            <div className="space-y-6">
-              <PixelCard variant="accent" className="text-center p-2 md:p-4">
-                <Flame className="w-8 h-8 md:w-12 md:h-12 mx-auto mb-1 md:mb-2 text-gray-900" />
-                <div className="text-2xl md:text-4xl font-bold mb-0 md:mb-1">{getVisibleLogs().length}</div>
-                <div className="text-xs md:text-sm font-bold uppercase">{currentUser.role === 'coach' ? 'Reviews' : 'Total Workouts'}</div>
-              </PixelCard>
-            </div>
-            )}
+
            </div>
          )}
+
+
+          {/* SHARED LOG MODAL */}
+          {isLogModalOpen && (
+            <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4 animate-in fade-in duration-200">
+              <div className="w-full max-w-2xl max-h-[90vh] overflow-y-auto">
+                <PixelCard className="relative shadow-[8px_8px_0_0_#4ecdc4] border-4 border-black">
+                  <button 
+                    onClick={() => {
+                       setIsLogModalOpen(false);
+                       setCurrentSessionItems([]);
+                       setSessionNotes('');
+                       setActiveLogId(null);
+                       setNewItem({ exercise: '', weight: '', reps: '10', sets: '3', muscle: '' });
+                    }}
+                    className="absolute top-4 right-4 text-gray-400 hover:text-black bg-white border-2 border-black p-1 hover:bg-red-100"
+                  >
+                    <X className="w-6 h-6" />
+                  </button>
+
+                  <h2 className="text-xl font-bold mb-4 flex items-center gap-2 border-b-4 border-black pb-2 text-[#ff6b6b]">
+                    <Dumbbell className="w-6 h-6" /> 
+                    {currentUser.role === 'coach' && viewingStudentId 
+                      ? `新增課表` 
+                      : '戰果'}
+                  </h2>
+                  
+                  {/* Coach: Plan Execution Date */}
+                  {currentUser.role === 'coach' && (
+                     <div className="mb-6 bg-[#fffff0] border-2 border-[#ffcd38] p-4">
+                        <label className="block text-sm font-bold text-gray-700 mb-2 uppercase flex items-center gap-2">
+                           <Calendar className="w-4 h-4" /> 預計執行時間
+                        </label>
+                        <input 
+                           type="date"
+                           value={planExecutionDate}
+                           onChange={(e) => setPlanExecutionDate(e.target.value)}
+                           className="w-full border-4 border-black p-2 font-bold focus:outline-none focus:shadow-[4px_4px_0_0_black] bg-white"
+                        />
+                     </div>
+                  )}
+
+                  {/* Student: Log Date */}
+                  {currentUser.role !== 'coach' && (
+                     <div className="mb-6 bg-gray-100 border-2 border-gray-300 p-4">
+                        <label className="block text-sm font-bold text-gray-700 mb-2 uppercase flex items-center gap-2">
+                           <Calendar className="w-4 h-4" /> 執行日期 (Date)
+                        </label>
+                        <input 
+                           type="date"
+                           value={studentLogDate}
+                           onChange={(e) => setStudentLogDate(e.target.value)}
+                           className="w-full border-4 border-black p-2 font-bold focus:outline-none focus:shadow-[4px_4px_0_0_black] bg-white"
+                        />
+                     </div>
+                  )}
+                  
+                  {/* Current Items List */}
+                  {currentSessionItems.length > 0 && (
+                    <div className="mb-6 space-y-2">
+                      <h4 className="font-bold text-gray-500 text-sm uppercase">本次項目</h4>
+                      {currentSessionItems.map((item, idx) => (
+                        <div key={item.id} className="bg-gray-100 border-2 border-gray-300 p-2 flex flex-col gap-2 text-sm">
+                           <div className="flex justify-between items-center">
+                              <div className="flex gap-2 items-center">
+                                 <span className="bg-black text-white w-5 h-5 flex items-center justify-center text-xs font-bold rounded-full">{idx + 1}</span>
+                                 <span className="font-bold">{item.exercise}</span>
+                                 <PixelBadge variant="warning" className="text-[10px] py-0">{item.muscle}</PixelBadge>
+                              </div>
+                              {(currentUser.role === 'coach' || !activeLogId || !logs.find(l => l.id === activeLogId)?.isPlan) && (
+                                <button onClick={() => handleRemoveItem(item.id)} className="text-red-500 hover:text-red-700">
+                                   <Trash2 size={16} />
+                                </button>
+                              )}
+                           </div>
+                           
+                           {/* Editable Inputs */}
+                           <div className="flex items-center gap-2">
+                              <div className="flex-1 flex items-center gap-1">
+                                <input 
+                                   type="number" 
+                                   value={item.weight}
+                                   onChange={(e) => handleUpdateItem(item.id, 'weight', e.target.value)} 
+                                   className="w-full border-2 border-gray-300 p-1 font-bold text-center focus:border-black outline-none"
+                                   placeholder="0"
+                                />
+                                <span className="text-xs text-gray-500">kg</span>
+                              </div>
+                              <span className="text-gray-300">x</span>
+                              <div className="flex-1 flex items-center gap-1">
+                                <input 
+                                   type="number" 
+                                   value={item.sets}
+                                   onChange={(e) => handleUpdateItem(item.id, 'sets', e.target.value)} 
+                                   className="w-full border-2 border-gray-300 p-1 font-bold text-center focus:border-black outline-none"
+                                   placeholder="0"
+                                />
+                                <span className="text-xs text-gray-500">組</span>
+                              </div>
+                              <span className="text-gray-300">x</span>
+                              <div className="flex-1 flex items-center gap-1">
+                                <input 
+                                   type="number" 
+                                   value={item.reps}
+                                   onChange={(e) => handleUpdateItem(item.id, 'reps', e.target.value)} 
+                                   className="w-full border-2 border-gray-300 p-1 font-bold text-center focus:border-black outline-none"
+                                   placeholder="0"
+                                />
+                                <span className="text-xs text-gray-500">次</span>
+                              </div>
+                           </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+
+                  {(currentUser.role === 'coach' || !activeLogId || !logs.find(l => l.id === activeLogId)?.isPlan) && (
+                  <div className="space-y-4 border-b-4 border-dotted border-gray-300 pb-6 mb-6">
+                    
+                    {/* Exercise Name */}
+                    <div>
+                        <PixelInput 
+                          label="項目" 
+                          placeholder="e.g. Bench Press" 
+                          value={newItem.exercise}
+                          list="exercise-list"
+                          onChange={e => {
+                            const val = e.target.value;
+                            // Only search within visible exercises to maintain consistency
+                            const existingExercise = getVisibleExercises().find(ex => ex.name.toLowerCase() === val.toLowerCase());
+                            
+                            // Try to find muscle from history if not in Wiki
+                            let muscleToFill = existingExercise ? existingExercise.muscle : newItem.muscle;
+                            
+                            if (!existingExercise && currentUser && val.trim()) {
+                               // Context aware history search
+                               const targetId = (currentUser.role === 'coach' && viewingStudentId) ? viewingStudentId : currentUser.id;
+                               const myLogs = logs.filter(l => l.studentId === targetId);
+                               
+                               for (const log of myLogs) {
+                                  const foundItem = log.items.find(item => item.exercise.toLowerCase() === val.toLowerCase());
+                                  if (foundItem && foundItem.muscle) {
+                                     muscleToFill = foundItem.muscle;
+                                     break; // Use the most recent muscle info
+                                  }
+                               }
+                            }
+
+                            setNewItem(prev => ({
+                              ...prev,
+                              exercise: val,
+                              muscle: muscleToFill
+                            }));
+                          }}
+                        />
+                        <datalist id="exercise-list">
+                          {getAvailableExerciseNames().map((name, i) => (
+                            <option key={i} value={name} />
+                          ))}
+                        </datalist>
+                        {(() => {
+                           const matched = getVisibleExercises().find(ex => ex.name.toLowerCase() === newItem.exercise.toLowerCase());
+                           if (matched && matched.level) {
+                              return (
+                                 <div className="mt-1 flex justify-end">
+                                    <div className="bg-black text-[#ffcd38] border-2 border-white px-2 py-0.5 font-bold text-xs rounded shadow-sm flex items-center gap-1 animate-pulse">
+                                        <span className="text-white">LV.{matched.level}</span> 
+                                        <span>{Array(matched.level).fill('★').join('')}</span>
+                                    </div>
+                                 </div>
+                              );
+                           }
+                           return null;
+                        })()}
+                    </div>
+
+                    {/* Tags */}
+                    <PixelInput 
+                      label="動作標籤" 
+                      placeholder="e.g. Chest" 
+                      value={newItem.muscle}
+                      onChange={e => setNewItem({...newItem, muscle: e.target.value})}
+                    />
+
+                    {/* Weight */}
+                    <PixelInput 
+                      label="重量 (Kg)" 
+                      type="number" 
+                      placeholder="0" 
+                      value={newItem.weight}
+                      onChange={e => setNewItem({...newItem, weight: e.target.value})}
+                    />
+
+                    {/* Sets & Reps */}
+                    <div className="grid grid-cols-2 gap-4">
+                      <PixelInput 
+                        label="組數" 
+                        type="number" 
+                        placeholder="0" 
+                        value={newItem.sets}
+                        onChange={e => setNewItem({...newItem, sets: e.target.value})}
+                        onFocus={() => {
+                           if (newItem.sets === '3') setNewItem(prev => ({ ...prev, sets: '' }));
+                        }}
+                      />
+                      <PixelInput 
+                        label="次數" 
+                        type="number" 
+                        placeholder="0" 
+                        value={newItem.reps}
+                        onChange={e => setNewItem({...newItem, reps: e.target.value})}
+                        onFocus={() => {
+                           if (newItem.reps === '10') setNewItem(prev => ({ ...prev, reps: '' }));
+                        }}
+                      />
+                    </div>
+                    
+                    <PixelButton type="button" onClick={handleAddItem} variant="primary" className="w-full border-4 border-black text-lg py-4 shadow-[4px_4px_0px_0px_#000]">
+                      <Plus className="w-5 h-5 mr-2" /> 增加項目
+                    </PixelButton>
+                  </div>
+                  )}
+                  
+                  <div className="space-y-4">
+                    {currentUser.role !== 'coach' && (
+                        <>
+                          <PixelInput 
+                            label="整組心得/筆記" 
+                            placeholder="今天的狀況如何？" 
+                            value={sessionNotes}
+                            onChange={e => setSessionNotes(e.target.value)}
+                          />
+                          <PixelInput 
+                             label="本次訓練總時長 (mins)" 
+                             type="number"
+                             placeholder="e.g. 60"
+                             value={sessionDuration.toString()}
+                             onChange={e => setSessionDuration(Number(e.target.value) || '')}
+                          />
+                        </>
+                    )}
+                    <div className="flex gap-2">
+                        <PixelButton onClick={handleSubmitSession} className="flex-1" variant="primary">
+                           {currentUser.role === 'coach' ? (viewingStudentId ? '指派課表' : '建立課表') : '完成今日鍛鍊'}
+                        </PixelButton>
+                        {currentUser.role === 'coach' && (
+                            <PixelButton 
+                                type="button" 
+                                variant="secondary"
+                                onClick={() => setIsAssignModalOpen(true)}
+                                className="bg-[#4ecdc4] text-black border-black border-4"
+                            >
+                                多人指派
+                            </PixelButton>
+                        )}
+                    </div>
+                  </div>
+                </PixelCard>
+              </div>
+            </div>
+          )}
+
+          {/* BULK ASSIGN MODAL */}
+          {isAssignModalOpen && (
+             <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/80 backdrop-blur-sm p-4 animate-in fade-in duration-200">
+                <div className="w-full max-w-md bg-white border-4 border-black shadow-[8px_8px_0_0_#4ecdc4] p-6 relative">
+                   <button 
+                     onClick={() => setIsAssignModalOpen(false)}
+                     className="absolute top-4 right-4 text-gray-400 hover:text-black"
+                   >
+                     <X className="w-6 h-6" />
+                   </button>
+                   
+                   <h3 className="text-xl font-bold mb-4 flex items-center gap-2 border-b-4 border-black pb-2 text-[#4ecdc4]">
+                      <User className="w-6 h-6" /> 選擇指派學員
+                   </h3>
+                   
+                   <div className="mb-4">
+                       <div className="flex justify-between items-center mb-2">
+                           <span className="font-bold text-sm">我的學員 ({assignSelectedStudents.length})</span>
+                           <button 
+                             type="button"
+                             className="text-xs underline text-blue-500 font-bold"
+                             onClick={() => {
+                                 const allMyStudentIds = users.filter(u => u.coachId === currentUser.id).map(u => u.id);
+                                 if (assignSelectedStudents.length === allMyStudentIds.length) {
+                                     setAssignSelectedStudents([]);
+                                 } else {
+                                     setAssignSelectedStudents(allMyStudentIds);
+                                 }
+                             }}
+                           >
+                             {assignSelectedStudents.length === users.filter(u => u.coachId === currentUser.id).length ? '取消全選' : '全選'}
+                           </button>
+                       </div>
+                       
+                       <div className="max-h-60 overflow-y-auto border-2 border-gray-200 p-2 space-y-2">
+                           {users.filter(u => u.coachId === currentUser.id).length === 0 ? (
+                               <div className="text-center text-gray-400 py-4">無學員</div>
+                           ) : (
+                               users.filter(u => u.coachId === currentUser.id).map(student => (
+                                   <label key={student.id} className="flex items-center gap-2 p-2 hover:bg-gray-50 cursor-pointer border border-transparent hover:border-gray-200">
+                                       <input 
+                                          type="checkbox" 
+                                          checked={assignSelectedStudents.includes(student.id)}
+                                          onChange={() => toggleAssignStudent(student.id)}
+                                          className="w-5 h-5 accent-[#4ecdc4]"
+                                       />
+                                       <span className="font-bold">{student.name}</span>
+                                       {student.status === 'disabled' && <span className="text-xs text-red-500">(Disabled)</span>}
+                                   </label>
+                               ))
+                           )}
+                       </div>
+                   </div>
+                   
+                   <PixelButton onClick={handleAssignPlan} className="w-full" variant="primary">
+                       確認指派 ({assignSelectedStudents.length} 位)
+                   </PixelButton>
+                </div>
+             </div>
+          )}
+
+          {/* STUDENT SHARE MODAL */}
+          {isShareModalOpen && (
+             <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/80 backdrop-blur-sm p-4 animate-in fade-in duration-200">
+                <div className="w-full max-w-md bg-white border-4 border-black shadow-[8px_8px_0_0_#4ecdc4] p-6 relative">
+                   <button 
+                     onClick={() => {
+                         setIsShareModalOpen(false);
+                         setShareSelectedStudentIds([]);
+                         setLogIdToShare(null);
+                     }}
+                     className="absolute top-4 right-4 text-gray-400 hover:text-black"
+                   >
+                     <X className="w-6 h-6" />
+                   </button>
+                   
+                   <h3 className="text-xl font-bold mb-4 flex items-center gap-2 border-b-4 border-black pb-2 text-[#4ecdc4]">
+                      <Share2 className="w-6 h-6" /> 分享給同教練學員
+                   </h3>
+                   
+                   <div className="mb-4">
+                       <div className="flex justify-between items-center mb-2">
+                           <span className="font-bold text-sm">選擇同學</span>
+                           <button 
+                             type="button"
+                             className="text-xs underline text-blue-500 font-bold"
+                             onClick={() => {
+                                 // Filter students with SAME coach, excluding self
+                                 const peers = users.filter(u => 
+                                     u.coachId === currentUser.coachId && 
+                                     u.id !== currentUser.id &&
+                                     u.role === 'student'
+                                 ).map(u => u.id);
+                                 
+                                 if (shareSelectedStudentIds.length === peers.length) {
+                                     setShareSelectedStudentIds([]);
+                                 } else {
+                                     setShareSelectedStudentIds(peers);
+                                 }
+                             }}
+                           >
+                             {shareSelectedStudentIds.length > 0 ? '取消全選' : '全選'}
+                           </button>
+                       </div>
+                       
+                       <div className="max-h-60 overflow-y-auto border-2 border-gray-200 p-2 space-y-2">
+                           {users.filter(u => u.coachId === currentUser.coachId && u.id !== currentUser.id && u.role === 'student').length === 0 ? (
+                               <div className="text-center text-gray-400 py-4">無其他同門師兄弟/姐妹</div>
+                           ) : (
+                               users.filter(u => u.coachId === currentUser.coachId && u.id !== currentUser.id && u.role === 'student').map(student => (
+                                   <label key={student.id} className="flex items-center gap-2 p-2 hover:bg-gray-50 cursor-pointer border border-transparent hover:border-gray-200">
+                                       <input 
+                                          type="checkbox" 
+                                          checked={shareSelectedStudentIds.includes(student.id)}
+                                          onChange={() => {
+                                              if (shareSelectedStudentIds.includes(student.id)) {
+                                                  setShareSelectedStudentIds(prev => prev.filter(id => id !== student.id));
+                                              } else {
+                                                  setShareSelectedStudentIds(prev => [...prev, student.id]);
+                                              }
+                                          }}
+                                          className="w-5 h-5 accent-[#4ecdc4]"
+                                       />
+                                       <span className="font-bold">{student.name}</span>
+                                   </label>
+                               ))
+                           )}
+                       </div>
+                   </div>
+                   
+                   <PixelButton onClick={handleShareLog} className="w-full" variant="primary">
+                       確認分享 ({shareSelectedStudentIds.length} 位)
+                   </PixelButton>
+                </div>
+             </div>
+          )}
 
 
         {/* WIKI TAB */}
         {activeTab === 'wiki' && (
           <div className="space-y-6 animate-in slide-in-from-right-4 duration-500">
-             {currentUser.role === 'coach' && (
-              <div className="flex justify-end mb-4">
-                <PixelButton 
-                  variant="accent" 
-                  onClick={() => setIsCoachZoneOpen(true)}
-                  className="shadow-[4px_4px_0_0_black] hover:translate-y-1 hover:shadow-none transition-all"
-                >
-                  <Camera className="w-5 h-5 mr-2" /> 教練上傳區 (Coach Zone)
-                </PixelButton>
-              </div>
-            )}
+
+             {/* Stats Block - Copied from Workout Diary */}
+             <div className="mb-6">
+                <PixelCard className="bg-white border-4 border-gray-200 p-4">
+                   <div className="flex flex-row gap-4 justify-center items-center">
+                      <div className="flex-1 text-center">
+                         <BookOpen className="w-8 h-8 mx-auto mb-1 text-gray-300" />
+                         <div className="text-2xl font-bold text-gray-800">{getVisibleExercises().length}</div>
+                         <div className="text-xs font-bold uppercase text-gray-400">Total Exercises</div>
+                      </div>
+                      <div className="w-0.5 h-12 bg-gray-200 dashed self-center"></div>
+                      <div className="flex-1 text-center">
+                         <div className="w-8 h-8 mx-auto mb-1 flex items-center justify-center text-gray-300 font-black text-xl">
+                            <Target className="w-6 h-6" />
+                         </div>
+                         <div className="text-2xl font-bold text-black flex justify-center items-baseline gap-0.5">
+                            {new Set(getVisibleExercises().map(e => e.muscle)).size}
+                            <span className="text-[10px] text-gray-400">types</span>
+                         </div>
+                         <div className="text-xs text-gray-400 uppercase font-bold">Muscle Groups</div>
+                      </div>
+                   </div>
+                </PixelCard>
+             </div>
+             
+             {/* Search & Actions Bar */}
+             <div className="flex flex-col md:flex-row gap-4 justify-between items-start md:items-center mb-6">
+                <div className="relative w-full md:w-auto flex-1 max-w-md">
+                   <div className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none">
+                      <Search className="h-5 w-5 text-gray-400" />
+                   </div>
+                   <input
+                      type="text"
+                      className="block w-full pl-10 pr-3 py-3 border-4 border-black font-bold placeholder-gray-400 focus:outline-none focus:shadow-[4px_4px_0_0_#4ecdc4]"
+                      placeholder="搜尋動作..."
+                      value={wikiSearchTerm}
+                      onChange={(e) => setWikiSearchTerm(e.target.value)}
+                   />
+                </div>
+
+                {currentUser.role === 'coach' && (
+                   <div className="flex gap-2">
+                     <PixelButton 
+                       variant="accent" 
+                       onClick={() => {
+                          setEditingExerciseId(null);
+                          setNewExercise({ name: '', muscle: '', guide: '', imageUrl: '', level: 1, tools: '' });
+                          setIsCoachZoneOpen(true);
+                       }}
+                       className="shadow-[4px_4px_0_0_black] hover:translate-y-1 hover:shadow-none transition-all whitespace-nowrap"
+                     >
+                       <Camera className="w-5 h-5 mr-2" /> 教練上傳區
+                     </PixelButton>
+                   </div>
+                )}
+             </div>
 
             {/* Coach Zone Modal */}
             {isCoachZoneOpen && (
@@ -1971,23 +2737,52 @@ export default function App() {
                         <X className="w-6 h-6" />
                       </button>
                       <h3 className="text-xl font-bold mb-4 text-[#ff6b6b] flex items-center gap-2 border-b-4 border-black pb-2">
-                        <Camera className="w-6 h-6" /> 教練上傳區 (Coach Zone)
+                        <Camera className="w-6 h-6" /> {editingExerciseId ? '編輯動作' : '教練上傳區'}
                       </h3>
                       <form onSubmit={handleUploadExercise} className="grid md:grid-cols-2 gap-4">
                         <PixelInput 
-                          label="動作名稱 (Exercise Name)" 
+                          label="動作名稱" 
                           value={newExercise.name} 
                           onChange={e => setNewExercise({...newExercise, name: e.target.value})}
                           placeholder="e.g. Barbell Squat"
                         />
                         <PixelInput 
-                          label="部位 (Muscle Group)" 
+                          label="動作標籤" 
                           value={newExercise.muscle} 
                           onChange={e => setNewExercise({...newExercise, muscle: e.target.value})}
                           placeholder="e.g. Legs"
                         />
                         <div className="md:col-span-2">
-                           <label className="font-bold text-gray-900 uppercase text-sm mb-1 block">動作圖片 (Image)</label>
+                          <PixelInput 
+                            label="所需器材" 
+                            value={newExercise.tools} 
+                            onChange={e => setNewExercise({...newExercise, tools: e.target.value})}
+                            placeholder="e.g. Dumbbell, Barbell, None"
+                          />
+                        </div>
+                        <div className="md:col-span-2">
+                           <label className="font-bold text-gray-900 uppercase text-sm mb-1 block">難度等級</label>
+                           <div className="flex gap-4 items-center">
+                              <div className="flex text-3xl cursor-pointer gap-1 bg-white border-4 border-black px-4 py-2 shadow-[4px_4px_0_0_black]">
+                                 {[1, 2, 3, 4, 5].map((star) => (
+                                    <span 
+                                       key={star}
+                                       onClick={() => setNewExercise({...newExercise, level: star})}
+                                       className={`transition-all duration-200 hover:scale-110 active:scale-95 ${
+                                          star <= (newExercise.level || 1) ? 'text-[#ffcd38] drop-shadow-[2px_2px_0_rgba(0,0,0,1)]' : 'text-gray-300'
+                                       }`}
+                                    >
+                                       ★
+                                    </span>
+                                 ))}
+                              </div>
+                              <div className="font-bold text-xl text-[#ff6b6b] ml-2">
+                                 LV.{newExercise.level || 1}
+                              </div>
+                           </div>
+                        </div>
+                        <div className="md:col-span-2">
+                           <label className="font-bold text-gray-900 uppercase text-sm mb-1 block">動作圖片</label>
                            <input 
                               type="file" 
                               accept="image/*"
@@ -1998,18 +2793,27 @@ export default function App() {
                               }}
                               className="w-full border-4 border-black p-2 font-bold focus:outline-none focus:shadow-[4px_4px_0_0_black] bg-white file:mr-4 file:py-2 file:px-4 file:border-2 file:border-black file:text-sm file:font-bold file:bg-gray-100 hover:file:bg-gray-200"
                            />
+                           {editingExerciseId && (
+                                <p className="text-xs text-gray-500 mt-1">* 留空則保留原圖</p>
+                           )}
                         </div>
                         <div className="md:col-span-2">
                            <PixelInput 
-                            label="姿勢介紹 / 重點 (Guide / Tips)" 
+                            label="姿勢介紹 / 重點" 
                             value={newExercise.guide} 
                             onChange={e => setNewExercise({...newExercise, guide: e.target.value})}
                             placeholder="描述動作要領..."
                           />
                         </div>
                         <div className="md:col-span-2 pt-2">
-                          <PixelButton variant="secondary" type="submit" className="w-full font-bold text-lg shadow-[4px_4px_0_0_rgba(0,0,0,1)] hover:shadow-[2px_2px_0_0_rgba(0,0,0,1)] hover:translate-x-[2px] hover:translate-y-[2px] transition-all border-2 border-black">
-                            <Plus className="w-5 h-5 mr-2" /> 發布新動作 (Publish Exercise)
+                          <PixelButton 
+                            variant="secondary" 
+                            type="submit" 
+                            className="w-full font-bold text-lg shadow-[4px_4px_0_0_rgba(0,0,0,1)] hover:shadow-[2px_2px_0_0_rgba(0,0,0,1)] hover:translate-x-[2px] hover:translate-y-[2px] transition-all border-2 border-black"
+                            isLoading={isSubmitting}
+                          >
+                             {editingExerciseId ? <CheckCircle className="w-5 h-5 mr-2" /> : <Plus className="w-5 h-5 mr-2" />} 
+                             {editingExerciseId ? '更新動作' : '發布新動作'}
                           </PixelButton>
                         </div>
                       </form>
@@ -2021,24 +2825,37 @@ export default function App() {
             <div className="grid md:grid-cols-2 gap-6">
               {getVisibleExercises().length === 0 ? (
                 <div className="md:col-span-2 text-center py-10 border-4 border-dashed border-gray-300 text-gray-400">
-                  {currentUser.role === 'coach' ? "您尚未發布任何動作" : "教練尚未發布任何動作"}
+                   {wikiSearchTerm ? "找不到符合的動作" : (currentUser.role === 'coach' ? "您尚未發布任何動作" : "教練尚未發布任何動作")}
                 </div>
               ) : (
                 getVisibleExercises().map(ex => (
                 <PixelCard key={ex.id} className="p-0 overflow-hidden flex flex-col">
-                  <div className="h-48 bg-gray-200 relative border-b-4 border-black">
-                     <ImageWithFallback 
-                        src={ex.imageUrl} 
-                        alt={ex.name}
-                        className="w-full h-full object-cover"
-                     />
-                     <div className="absolute top-2 right-2">
-                        <PixelBadge variant="warning">{ex.muscle}</PixelBadge>
-                     </div>
-                  </div>
+                  <ExerciseImage src={ex.imageUrl} alt={ex.name} />
                   <div className="p-4 flex-1 flex flex-col">
                     <h3 className="text-xl font-bold mb-2">{ex.name}</h3>
-                    <p className="text-sm text-gray-600 mb-4 flex-1">{ex.guide}</p>
+                    
+                    {/* Metadata Badges */}
+                    <div className="flex flex-wrap gap-2 mb-3">
+                        {ex.level && (
+                           <div className="bg-black text-[#ffcd38] border-2 border-white px-2 py-0.5 font-bold text-xs shadow-sm flex items-center gap-1">
+                              <span className="text-white">LV.{ex.level}</span> 
+                              <span>{Array(ex.level).fill('★').join('')}</span>
+                           </div>
+                        )}
+                        <PixelBadge variant="warning">{ex.muscle}</PixelBadge>
+                        {ex.tools && (
+                           <PixelBadge variant="outline" className="flex items-center gap-1 bg-white">
+                              <Dumbbell className="w-3 h-3" />
+                              {ex.tools}
+                           </PixelBadge>
+                        )}
+                    </div>
+
+                    <div className="flex-1 mb-4">
+                        {ex.guide && ex.guide !== '無介紹' && (
+                            <p className="text-sm text-gray-600 whitespace-pre-wrap">{ex.guide}</p>
+                        )}
+                    </div>
                     <div className="mt-4 pt-4 border-t-2 border-dashed border-gray-300 flex justify-between items-center text-xs text-gray-500">
                       <div className="flex items-center gap-1 font-bold text-gray-700">
                         <User className="w-3 h-3" />
@@ -2046,15 +2863,23 @@ export default function App() {
                       </div>
                       <div className="flex items-center gap-3">
                          {ex.author === currentUser.name && (
-                           <button 
-                             onClick={() => handleDeleteExercise(ex.id)}
-                             className="text-gray-400 hover:text-[#ff6b6b] transition-colors"
-                             title="刪除此動作"
-                           >
-                             <Trash2 className="w-4 h-4" />
-                           </button>
+                           <>
+                               <button 
+                                   onClick={() => handleStartEditExercise(ex)}
+                                   className="text-gray-400 hover:text-blue-500 transition-colors"
+                                   title="編輯此動作"
+                               >
+                                   <Edit className="w-4 h-4" />
+                               </button>
+                               <button 
+                                   onClick={() => handleDeleteExercise(ex.id)}
+                                   className="text-gray-400 hover:text-[#ff6b6b] transition-colors"
+                                   title="刪除此動作"
+                               >
+                                   <Trash2 className="w-4 h-4" />
+                               </button>
+                           </>
                          )}
-                         <button className="text-[#4ecdc4] font-bold hover:underline">查看詳情 &gt;</button>
                       </div>
                     </div>
                   </div>
@@ -2071,7 +2896,7 @@ export default function App() {
                 <h2 className="text-2xl font-bold text-shadow-pixel text-[#ff6b6b]">BATTLE ARENA</h2>
                 {currentUser.role !== 'coach' && (
                    <PixelButton size="sm" variant="outline" onClick={() => setIsCreatingBattle(!isCreatingBattle)}>
-                     {isCreatingBattle ? '取消 (Cancel)' : <><Plus className="w-4 h-4 mr-1"/> 發起挑戰</>}
+                     {isCreatingBattle ? '取消' : <><Plus className="w-4 h-4 mr-1"/> 發起挑戰</>}
                    </PixelButton>
                 )}
              </div>
@@ -2112,7 +2937,7 @@ export default function App() {
              {isCreatingBattle && currentUser.role !== 'coach' && (
                 <PixelCard className="mb-6 border-dashed border-[#ff6b6b] bg-[#fff5f5]">
                   <div className="flex justify-between items-center mb-4">
-                     <h3 className="font-bold">發起挑戰 (Create Challenge)</h3>
+                     <h3 className="font-bold">發起挑戰</h3>
                      <PixelButton 
                         size="sm" 
                         variant="outline" 
@@ -2167,13 +2992,13 @@ export default function App() {
                     />
                     
                     <div>
-                      <label className="font-bold text-gray-900 uppercase text-sm mb-1 block">指定挑戰對象 (Target)</label>
+                      <label className="font-bold text-gray-900 uppercase text-sm mb-1 block">指定挑戰對象</label>
                       <select 
                          className="w-full border-4 border-black p-2 font-bold focus:outline-none focus:shadow-[4px_4px_0_0_black] bg-white"
                          value={newBattle.targetStudentId}
                          onChange={e => setNewBattle({...newBattle, targetStudentId: e.target.value})}
                       >
-                         <option value="">🌍 全員挑戰 (Open to All)</option>
+                         <option value="">🌍 全員挑戰</option>
                          {users.filter(u => u.role === 'student' && u.name !== currentUser?.name).map(u => (
                             <option key={u.id} value={u.id}>👉 {u.name}</option>
                          ))}
@@ -2181,7 +3006,7 @@ export default function App() {
                     </div>
 
                     <div>
-                      <label className="font-bold text-gray-900 uppercase text-sm mb-1 block">菜單內容 (Routine)</label>
+                      <label className="font-bold text-gray-900 uppercase text-sm mb-1 block">菜單內容</label>
                       <textarea 
                         readOnly
                         className="w-full border-4 border-gray-200 p-2 font-mono focus:border-black outline-none min-h-[100px] bg-gray-100 text-gray-500 cursor-not-allowed"
@@ -2189,7 +3014,7 @@ export default function App() {
                         value={newBattle.routine}
                       />
                     </div>
-                    <PixelButton type="submit" variant="primary" className="w-full">發布挑戰 (PUBLISH)</PixelButton>
+                    <PixelButton type="submit" variant="primary" className="w-full">發布挑戰</PixelButton>
                   </form>
                 </PixelCard>
              )}
@@ -2314,7 +3139,7 @@ export default function App() {
                             ))}
                           </div>
                         ) : (
-                          <div className="text-xs text-gray-400 italic mb-3">尚無留言 (No comments yet)</div>
+                          <div className="text-xs text-gray-400 italic mb-3">尚無留言</div>
                         )}
 
                         {/* Add Comment */}
@@ -2342,7 +3167,7 @@ export default function App() {
                         <div className="mb-4 bg-gray-50 border-2 border-black p-3">
                            <h5 className="font-bold text-xs uppercase mb-2 flex items-center gap-1">
                               <Trophy className="w-3 h-3 text-[#ffcd38]" /> 
-                              挑戰紀錄 (Leaderboard)
+                              挑戰紀錄
                            </h5>
                            <div className="space-y-2">
                               {battle.records.map((record) => (
@@ -2367,7 +3192,7 @@ export default function App() {
                                size="sm" 
                                onClick={() => setSelectedBattleForRecord(battle)}
                             >
-                               接受挑戰 (FIGHT)
+                               接受挑戰
                             </PixelButton>
                          )}
                       </div>
@@ -2404,13 +3229,360 @@ export default function App() {
                            onChange={e => setBattleRecordInput(e.target.value)}
                         />
                         <PixelButton className="w-full" onClick={handleSubmitBattleRecord}>
-                           提交 (SUBMIT)
+                           提交
                         </PixelButton>
                      </div>
                   </div>
                </div>
              )}
           </div>
+        )}
+
+
+        {/* ACHIEVEMENTS TAB */}
+        {activeTab === 'achievements' && (
+           <div className="space-y-8 animate-in slide-in-from-right-4 duration-500">
+             {/* STUDENT VIEW */}
+             {currentUser.role === 'student' && (
+                <>
+                   {/* System Achievements */}
+                   <div>
+                      <h2 className="text-2xl font-bold mb-4 flex items-center gap-2 border-b-4 border-black pb-2 text-[#ff6b6b]">
+                        <Trophy className="w-6 h-6" /> 系統成就
+                      </h2>
+                      <div className="grid grid-cols-2 md:grid-cols-3 gap-4">
+                         {systemAchievements.map(ach => {
+                            const { isUnlocked, current, threshold, progressText } = getAchievementProgress(ach, logs.filter(l => l.studentId === currentUser.id));
+                            const isSelected = currentUser.selectedBadgeIds?.includes(ach.id);
+
+                            return (
+                               <div 
+                                  key={ach.id} 
+                                  onClick={() => isUnlocked && handleToggleBadgeSelection(ach.id)}
+                                  className={`border-4 p-4 relative transition-all ${
+                                     isUnlocked 
+                                     ? `bg-white border-black shadow-[4px_4px_0_0_black] cursor-pointer hover:-translate-y-1 hover:shadow-[6px_6px_0_0_black] ${isSelected ? 'ring-4 ring-[#ffcd38] ring-offset-2' : ''}` 
+                                     : 'bg-gray-100 border-gray-300 text-gray-400 grayscale'
+                                  }`}
+                               >
+                                  {isSelected && (
+                                      <div className="absolute top-2 right-2 text-[#ffcd38]">
+                                          <CheckCircle className="w-6 h-6 fill-black" />
+                                      </div>
+                                  )}
+                                  
+                                  <div className="text-3xl mb-2">{ach.icon}</div>
+                                  <h3 className="font-bold">{ach.name}</h3>
+                                  <p className="text-xs mt-1 mb-2">{ach.description}</p>
+                                  
+                                  {/* Progress Bar */}
+                                  <div className="w-full bg-gray-200 h-2 mt-2 rounded-full overflow-hidden border border-black/10">
+                                      <div 
+                                          className={`h-full ${isUnlocked ? 'bg-[#9333ea]' : 'bg-gray-400'}`} 
+                                          style={{ width: `${Math.min((current / threshold) * 100, 100)}%` }}
+                                      />
+                                  </div>
+                                  <div className="flex justify-between items-center mt-1">
+                                       <span className="text-[10px] font-bold font-mono">{progressText}</span>
+                                       {!isUnlocked && (
+                                          <span className="text-[10px] font-bold bg-black text-white px-1.5 py-0.5">LOCKED</span>
+                                       )}
+                                       {isUnlocked && !isSelected && (
+                                          <span className="text-[10px] text-gray-400">Click to Select</span>
+                                       )}
+                                  </div>
+                               </div>
+                            );
+                         })}
+                      </div>
+                   </div>
+
+                   {/* Coach Achievements */}
+                   <div>
+                      <h2 className="text-2xl font-bold mb-4 flex items-center gap-2 border-b-4 border-black pb-2 text-[#4ecdc4]">
+                        <Star className="w-6 h-6" /> 教練成就 (Coach Challenges)
+                      </h2>
+                      
+                      {(() => {
+                         // Combine Legacy Custom Badges + Defined Achievements
+                         const coach = users.find(u => u.id === currentUser.coachId);
+                         
+                         // Legacy Badges
+                         const legacyBadges = currentUser.customBadges || [];
+
+                         return (
+                            <div className="space-y-6">
+                                {/* Coach Defined Challenges */}
+                                {coach && coach.definedAchievements && coach.definedAchievements.length > 0 && (
+                                   <div className="grid grid-cols-2 md:grid-cols-3 gap-4">
+                                      {coach.definedAchievements.map(ach => {
+                                           const { isUnlocked, current, threshold, progressText } = getAchievementProgress(ach, logs.filter(l => l.studentId === currentUser.id));
+                                           const isSelected = currentUser.selectedBadgeIds?.includes(ach.id);
+
+                                           return (
+                                              <div 
+                                                 key={ach.id} 
+                                                 onClick={() => isUnlocked && handleToggleBadgeSelection(ach.id)}
+                                                 className={`border-4 p-4 relative transition-all ${
+                                                    isUnlocked 
+                                                    ? `bg-white border-black shadow-[4px_4px_0_0_black] cursor-pointer hover:-translate-y-1 hover:shadow-[6px_6px_0_0_black] ${isSelected ? 'ring-4 ring-[#ffcd38] ring-offset-2' : ''}` 
+                                                    : 'bg-gray-100 border-gray-300 text-gray-400 grayscale'
+                                                 }`}
+                                              >
+                                                 {isSelected && (
+                                                     <div className="absolute top-2 right-2 text-[#ffcd38]">
+                                                         <CheckCircle className="w-6 h-6 fill-black" />
+                                                     </div>
+                                                 )}
+                                                 
+                                                 <div className="text-3xl mb-2">{ach.icon}</div>
+                                                 <h3 className="font-bold">{ach.title}</h3>
+                                                 <p className="text-xs mt-1 mb-2">{ach.description}</p>
+                                                 
+                                                 {/* Progress Bar */}
+                                                 <div className="w-full bg-gray-200 h-2 mt-2 rounded-full overflow-hidden border border-black/10">
+                                                     <div 
+                                                         className={`h-full ${isUnlocked ? 'bg-[#4ecdc4]' : 'bg-gray-400'}`} 
+                                                         style={{ width: `${Math.min((current / threshold) * 100, 100)}%` }}
+                                                     />
+                                                 </div>
+                                                 <div className="flex justify-between items-center mt-1">
+                                                      <span className="text-[10px] font-bold font-mono">{progressText}</span>
+                                                      {!isUnlocked && (
+                                                         <span className="text-[10px] font-bold bg-black text-white px-1.5 py-0.5">LOCKED</span>
+                                                      )}
+                                                 </div>
+                                              </div>
+                                           );
+                                      })}
+                                   </div>
+                                )}
+
+                                {/* Legacy Manual Badges */}
+                                {legacyBadges.length > 0 && (
+                                   <>
+                                      <h3 className="text-sm font-bold text-gray-400 uppercase mt-4">Legacy Awards</h3>
+                                      <div className="grid grid-cols-2 md:grid-cols-3 gap-4">
+                                         {legacyBadges.map((badge, idx) => (
+                                            <div key={idx} className={`border-4 border-black p-4 bg-white shadow-[4px_4px_0_0_black] ${badge.color}`}>
+                                               <div className="text-3xl mb-2">{badge.icon}</div>
+                                               <h3 className="font-bold">{badge.name}</h3>
+                                               <p className="text-xs mt-1">來自教練的獎勵</p>
+                                            </div>
+                                         ))}
+                                      </div>
+                                   </>
+                                )}
+                                
+                                {(!coach?.definedAchievements?.length && !legacyBadges.length) && (
+                                    <div className="p-8 border-4 border-dashed border-gray-300 text-center text-gray-400 rounded-lg bg-gray-50">
+                                        尚未獲得教練成就
+                                    </div>
+                                )}
+                            </div>
+                         );
+                      })()}
+                   </div>
+                </>
+             )}
+
+             {/* COACH/ADMIN VIEW */}
+             {currentUser.role === 'coach' && (
+                <>
+                   {/* System Achievements Management */}
+                   <div>
+                      <h2 className="text-2xl font-bold mb-4 flex items-center gap-2 border-b-4 border-black pb-2 text-[#ff6b6b]">
+                        <Trophy className="w-6 h-6" /> 系統成就
+                      </h2>
+                      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                         {systemAchievements.map(ach => (
+                            <div key={ach.id} className="border-4 border-black p-4 bg-white shadow-[4px_4px_0_0_black] flex justify-between items-center">
+                               <div>
+                                  <div className="flex items-center gap-2 mb-1">
+                                     <span className="text-2xl">{ach.icon}</span>
+                                     <h3 className="font-bold">{ach.name}</h3>
+                                  </div>
+                                  <p className="text-sm text-gray-600">{ach.description}</p>
+                                  <p className="text-xs text-gray-400 mt-1 font-mono">Condition: {ach.type} {'>='} {ach.threshold}</p>
+                               </div>
+                               {currentUser.name === 'iisa' && (
+                                  <PixelButton size="sm" variant="outline" onClick={() => {
+                                     const newThreshold = prompt(`Update threshold for ${ach.name}`, ach.threshold.toString());
+                                     if (newThreshold) {
+                                        setSystemAchievements(prev => prev.map(p => p.id === ach.id ? { ...p, threshold: Number(newThreshold) } : p));
+                                     }
+                                  }}>
+                                     <Edit className="w-4 h-4" />
+                                  </PixelButton>
+                               )}
+                            </div>
+                         ))}
+                      </div>
+                      {currentUser.name === 'iisa' && (
+                         <p className="text-xs text-gray-500 mt-2">* Admin can edit thresholds by clicking the edit icon.</p>
+                      )}
+                   </div>
+
+                   {/* Custom Tasks / Badges Management */}
+                   <div>
+                      <h2 className="text-2xl font-bold mb-4 flex items-center gap-2 border-b-4 border-black pb-2 text-[#4ecdc4]">
+                        <Star className="w-6 h-6" /> 自訂成就任務 (My Student Challenges)
+                      </h2>
+                      
+                      <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">
+                         {currentUser.definedAchievements?.map(ach => (
+                            <div key={ach.id} className="border-4 border-black p-4 bg-white flex justify-between items-center relative overflow-hidden group">
+                               <div>
+                                  <div className="flex items-center gap-2 mb-1">
+                                     <span className="text-2xl">{ach.icon}</span>
+                                     <h3 className="font-bold">{ach.title}</h3>
+                                  </div>
+                                  <p className="text-sm text-gray-600">{ach.description}</p>
+                                  <div className="text-[10px] bg-gray-100 text-gray-500 inline-block px-1 mt-1 font-mono">
+                                     {ach.criteriaType} {'>='} {ach.criteriaValue}
+                                  </div>
+                               </div>
+                               <PixelButton 
+                                  size="sm" 
+                                  variant="secondary"
+                                  className="text-red-500 hover:bg-red-50"
+                                  onClick={async () => {
+                                      if (confirm("Delete this challenge?")) {
+                                          const newDefined = currentUser.definedAchievements?.filter(a => a.id !== ach.id);
+                                          const updatedUser = { ...currentUser, definedAchievements: newDefined };
+                                          setCurrentUser(updatedUser);
+                                          setUsers(users.map(u => u.id === currentUser.id ? updatedUser : u));
+                                          await api.updateAccount({ definedAchievements: newDefined });
+                                      }
+                                  }}
+                               >
+                                  <Trash2 className="w-4 h-4" />
+                               </PixelButton>
+                            </div>
+                         ))}
+                         
+                         <button 
+                            className="border-4 border-dashed border-gray-300 p-4 flex flex-col items-center justify-center text-gray-400 hover:border-black hover:text-black transition-colors"
+                            onClick={() => {
+                               setIsAchievementModalOpen(true);
+                               setNewAchievement({
+                                   title: '', description: '', icon: '🏆', criteriaType: 'log_count', criteriaValue: 5, targetAudience: 'students'
+                               });
+                            }}
+                         >
+                            <Plus className="w-8 h-8 mb-2" />
+                            <span className="font-bold">Create New Challenge</span>
+                         </button>
+                      </div>
+                   </div>
+
+                   {/* Create Achievement Modal */}
+                   {isAchievementModalOpen && (
+                      <div className="fixed inset-0 bg-black/80 z-[60] flex items-center justify-center p-4 backdrop-blur-sm">
+                         <div className="w-full max-w-md bg-white border-4 border-black shadow-[8px_8px_0_0_rgba(0,0,0,0.5)] flex flex-col relative animate-in zoom-in duration-200 p-6">
+                            <button 
+                               onClick={() => setIsAchievementModalOpen(false)}
+                               className="absolute top-4 right-4 text-gray-400 hover:text-black"
+                            >
+                               <X className="w-6 h-6" />
+                            </button>
+                            
+                            <h3 className="text-xl font-bold mb-4 flex items-center gap-2">
+                               <Star className="w-6 h-6 text-[#4ecdc4]" />
+                               建立新挑戰
+                            </h3>
+                            
+                            <div className="space-y-4">
+                               <PixelInput 
+                                  label="成就名稱 (Title)" 
+                                  value={newAchievement.title} 
+                                  onChange={e => setNewAchievement({...newAchievement, title: e.target.value})} 
+                                  placeholder="e.g. 核心殺手"
+                               />
+                               <PixelInput 
+                                  label="描述 (Description)" 
+                                  value={newAchievement.description} 
+                                  onChange={e => setNewAchievement({...newAchievement, description: e.target.value})} 
+                                  placeholder="e.g. 完成 10 次核心訓練"
+                               />
+                               <div className="flex gap-2">
+                                   <div className="w-1/3">
+                                       <PixelInput 
+                                          label="圖示 (Emoji)" 
+                                          value={newAchievement.icon} 
+                                          onChange={e => setNewAchievement({...newAchievement, icon: e.target.value})} 
+                                       />
+                                   </div>
+                                   <div className="flex-1">
+                                       <label className="text-xs font-bold mb-1 block uppercase text-gray-500">條件類型 (Criteria)</label>
+                                       <select 
+                                          className="w-full border-2 border-black p-2 font-bold bg-white"
+                                          value={newAchievement.criteriaType}
+                                          onChange={e => setNewAchievement({...newAchievement, criteriaType: e.target.value as any})}
+                                       >
+                                           <option value="log_count">訓練次數 (Log Count)</option>
+                                           <option value="max_weight">最大重量 (Max Weight)</option>
+                                           <option value="total_time">訓練總時間 (Total Time)</option>
+                                           <option value="plan_count">完成課表數 (Completed Plans)</option>
+                                       </select>
+                                   </div>
+                               </div>
+                               
+                               <div className="flex gap-2">
+                                   <div className="flex-1">
+                                      <PixelInput 
+                                         label="目標數值 (Threshold)" 
+                                         type="number"
+                                         value={newAchievement.criteriaValue?.toString()} 
+                                         onChange={e => setNewAchievement({...newAchievement, criteriaValue: Number(e.target.value)})} 
+                                      />
+                                   </div>
+                                   {newAchievement.criteriaType === 'max_weight' && (
+                                       <div className="flex-1">
+                                           <PixelInput 
+                                              label="指定動作 (Optional)" 
+                                              value={newAchievement.criteriaExercise || ''} 
+                                              onChange={e => setNewAchievement({...newAchievement, criteriaExercise: e.target.value})} 
+                                              placeholder="Any"
+                                           />
+                                       </div>
+                                   )}
+                               </div>
+
+                               <PixelButton className="w-full" onClick={async () => {
+                                   if (!newAchievement.title || !newAchievement.criteriaValue) return;
+                                   
+                                   const ach: Achievement = {
+                                       id: `coach_${Date.now()}`,
+                                       creatorId: currentUser.id,
+                                       targetAudience: 'students',
+                                       title: newAchievement.title!,
+                                       description: newAchievement.description || '',
+                                       icon: newAchievement.icon || '🏆',
+                                       criteriaType: newAchievement.criteriaType as any,
+                                       criteriaValue: newAchievement.criteriaValue!,
+                                       criteriaExercise: newAchievement.criteriaExercise
+                                   };
+                                   
+                                   const newDefined = [...(currentUser.definedAchievements || []), ach];
+                                   const updatedUser = { ...currentUser, definedAchievements: newDefined };
+                                   
+                                   setCurrentUser(updatedUser);
+                                   setUsers(users.map(u => u.id === currentUser.id ? updatedUser : u));
+                                   await api.updateAccount({ definedAchievements: newDefined });
+                                   
+                                   setIsAchievementModalOpen(false);
+                                   showToast("新挑戰已建立！", 'success');
+                               }}>
+                                  建立挑戰
+                               </PixelButton>
+                            </div>
+                         </div>
+                      </div>
+                   )}
+                </>
+             )}
+           </div>
         )}
 
         {/* ADMIN TAB */}
@@ -2420,7 +3592,7 @@ export default function App() {
                 <div className="space-y-6">
                   <div className="flex justify-between items-center border-b-4 border-black pb-4">
                      <h2 className="text-2xl font-bold text-[#4ecdc4] flex items-center gap-2">
-                        <User className="w-8 h-8" /> {currentUser.name === 'iisa' ? '全校學員 (All Students)' : '我的學員 (My Students)'}
+                        <User className="w-8 h-8" /> {currentUser.name === 'iisa' ? '全校學員' : '我的學員'}
                      </h2>
                      
                      <div className="flex items-center gap-3">
@@ -2453,23 +3625,33 @@ export default function App() {
                          const lastWorkout = studentLogs.length > 0 ? studentLogs[0].date : null;
                          
                          // Calculate Badges
-                         const badges = [];
-                         if (totalWorkouts >= 1) badges.push({ icon: '🏅', name: '新手上路', color: 'bg-green-100 text-green-700' });
-                         if (totalWorkouts >= 10) badges.push({ icon: '🥉', name: '持之以恆', color: 'bg-orange-100 text-orange-700' });
-                         if (totalWorkouts >= 30) badges.push({ icon: '🥈', name: '健身運動員', color: 'bg-gray-100 text-gray-700' });
-                         if (totalWorkouts >= 50) badges.push({ icon: '🥇', name: '健身菁英', color: 'bg-yellow-100 text-yellow-700' });
+                         const badges: any[] = [];
+                         systemAchievements.forEach(ach => {
+                             if (checkAchievement(ach, studentLogs)) {
+                                 badges.push({ icon: ach.icon, name: ach.name, color: ach.color, id: ach.id });
+                             }
+                         });
                          
-                         // Heavy Lifter Check
+                         // Calculate Max Weight (for stats)
                          const maxWeight = studentLogs.reduce((max, log) => {
                             const logMax = log.items.reduce((m, i) => Math.max(m, i.weight), 0);
                             return Math.max(max, logMax);
                          }, 0);
                          
-                         if (maxWeight >= 100) badges.push({ icon: '💪', name: '大士', color: 'bg-red-100 text-red-700' });
-                         
                          // Add Custom Badges
                          if (student.customBadges) {
                             badges.push(...student.customBadges);
+                         }
+
+                         // Sort by Selection (Pinned First)
+                         if (student.selectedBadgeIds && student.selectedBadgeIds.length > 0) {
+                             badges.sort((a, b) => {
+                                 const aSelected = a.id && student.selectedBadgeIds?.includes(a.id);
+                                 const bSelected = b.id && student.selectedBadgeIds?.includes(b.id);
+                                 if (aSelected && !bSelected) return -1;
+                                 if (!aSelected && bSelected) return 1;
+                                 return 0;
+                             });
                          }
 
                          return (
@@ -2534,8 +3716,10 @@ export default function App() {
                                   <div className="mt-auto space-y-2 pt-4 border-t-2 border-black">
                                     {currentUser.name === 'iisa' && (
                                       <div className="space-y-2 mb-2 pb-2 border-b border-dashed border-gray-300">
-                                         <select 
-                                            className="w-full text-xs border-2 border-black p-1 bg-gray-50 font-bold focus:outline-none focus:ring-2 focus:ring-[#ffcd38]"
+                                         <div className="flex items-center gap-2 mb-1">
+                                            <label className="text-xs font-bold whitespace-nowrap">教練:</label>
+                                            <select 
+                                               className="flex-1 text-xs border-2 border-black p-1 bg-gray-50 font-bold focus:outline-none focus:ring-2 focus:ring-[#ffcd38]"
                                             value={student.coachId || ''}
                                             onChange={(e) => assignCoach(student.id, e.target.value)}
                                          >
@@ -2546,6 +3730,7 @@ export default function App() {
                                                </option>
                                             ))}
                                          </select>
+                                         </div>
 
                                          <div className="flex gap-2">
                                             <PixelButton 
@@ -2568,7 +3753,7 @@ export default function App() {
                                       </div>
                                     )}
                                     <PixelButton size="sm" className="w-full" onClick={() => setAdminSelectedStudentId(student.id)}>
-                                      <BookOpen className="w-4 h-4 mr-2" /> 查看日記 (View Logs)
+                                      <BookOpen className="w-4 h-4 mr-2" /> 查看日記
                                     </PixelButton>
                                   </div>
                                </div>
@@ -2588,7 +3773,7 @@ export default function App() {
               {/* Header */}
               <div className="flex justify-between items-center border-b-4 border-black pb-4">
                  <h2 className="text-2xl font-bold text-[#ffcd38] flex items-center gap-2">
-                    <Trophy className="w-8 h-8" /> 全校教練 (All Coaches)
+                    <Trophy className="w-8 h-8" /> 全校教練
                  </h2>
                  <div className="flex items-center gap-3">
                     <PixelBadge variant="accent" className="text-lg bg-[#ffcd38] text-black border-black">
@@ -2602,7 +3787,7 @@ export default function App() {
                  {users.filter(u => u.role === 'coach').length === 0 ? (
                      <div className="col-span-3 text-center py-10 border-4 border-dashed border-gray-300 rounded bg-gray-50">
                        <Trophy className="w-12 h-12 mx-auto text-gray-300 mb-2" />
-                       <p className="text-gray-500 font-bold">目前無教練 (No Coaches)</p>
+                       <p className="text-gray-500 font-bold">目前無教練</p>
                      </div>
                  ) : (
                      users.filter(u => u.role === 'coach').map(coach => {
